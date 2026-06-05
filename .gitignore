@@ -1,0 +1,14 @@
+# 不需要上传到 GitHub 的文件
+
+# 本地数据库（你自己电脑上的股票池数据，不用上传）
+*.db
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器/系统杂项
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

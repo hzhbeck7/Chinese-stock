@@ -1,0 +1,9 @@
+# 硬科技紫苏叶 AI 投研与综合择时系统 —— 依赖清单
+# 安装命令： pip install -r requirements.txt
+
+streamlit>=1.30.0          # Web 前端框架
+akshare>=1.12.0            # A股行情/财务/龙虎榜数据接口
+pandas>=2.0.0             # 数据处理与指标计算
+requests>=2.31.0          # 调用 DeepSeek API（OpenAI 兼容 HTTP 接口）
+google-generativeai>=0.5.0 # 调用 Google Gemini 视觉大模型
+Pillow>=10.0.0           # 读取上传的筹码分布图片
