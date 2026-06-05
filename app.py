@@ -333,6 +333,77 @@ def call_deepseek_agent(api_key, model, history):
         return False, None, f"未知错误：{e}"
 
 
+PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专家，精通"紫苏叶理论"，现在要主动跨赛道为用户挖掘潜力股。
+
+【紫苏叶公司标准】（推荐的每只股需同时满足）：
+1. 处于产业链深层节点（Layer3 及以下：底层硬件、核心材料、关键设备、卡脖子零部件等"卖水人"），而非终端品牌或应用层。
+2. 产品/技术不可替代，技术壁垒或专利护城河高。
+3. 寡头垄断格局（全球或国内有效竞争对手 <= 3 家）。
+
+【任务——三步思维链】：
+第一步：识别当前A股市场最核心的 3 到 5 个硬科技热门赛道（要多元，不要只盯机器人；可考虑如固态电池、低空经济、商业航天、合成生物、AI算力/光模块、半导体设备/材料、可控核聚变等当下真实热门方向）。
+第二步：在每个赛道里，用紫苏叶理论深度挖掘那条"别人离不开、卡脖子、玩家极少"的底层环节。
+第三步：每个赛道推荐 1-2 只最符合紫苏叶标准的 A 股上市公司（须是真实存在的A股，给出准确的6位代码）。
+
+【输出格式——必须严格遵守】：
+只返回一个 JSON 对象（不要任何额外文字、不要markdown代码块标记），格式如下：
+{
+ "sectors": [
+   {
+     "sector": "赛道名称（如：固态电池）",
+     "logic": "这个赛道里紫苏叶环节在哪、为什么是卖水人（大白话，60字内）",
+     "stocks": [
+       {
+         "name": "公司中文简称",
+         "code": "6位股票代码",
+         "bottleneck": "它卡的是哪个脖子/处在哪个底层节点（大白话）",
+         "competitors": "全球或国内的有效竞争对手大致有哪几家（体现玩家极少）",
+         "reason": "用大白话总结为什么它符合紫苏叶标准，100字内，让股票小白也能看懂"
+       }
+     ]
+   }
+ ]
+}
+注意：宁缺毋滥，拿不准是否真实存在的公司不要硬编代码；代码必须是真实的6位A股代码。"""
+
+
+def call_deepseek_miner(api_key, model):
+    """
+    AI 主动跨赛道挖掘紫苏叶股。返回 (ok, result_dict, err_msg)。
+    result_dict 含 sectors 列表。
+    """
+    if not api_key:
+        return False, None, "未填写 DeepSeek API Key（请在左侧边栏填写）。"
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model or "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": PERILLA_MINER_PROMPT},
+            {"role": "user", "content": "请现在扫描全市场热门硬科技赛道，按要求挖掘并推荐紫苏叶股。"},
+        ],
+        "temperature": 0.6,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    try:
+        # 思维链较长，给更宽的超时
+        resp = requests.post(url, headers=headers, json=payload, timeout=max(HTTP_TIMEOUT, 90))
+        if resp.status_code != 200:
+            return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = _safe_parse_json(content)
+        if data is None or "sectors" not in data:
+            return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
+        return True, data, ""
+    except requests.exceptions.Timeout:
+        return False, None, "调用 DeepSeek 超时（思维链较慢），请重试。"
+    except requests.exceptions.RequestException as e:
+        return False, None, f"网络请求异常：{e}"
+    except Exception as e:
+        return False, None, f"未知错误：{e}"
+
+
 def _safe_parse_json(text):
     """从模型返回文本中尽量稳妥地解析出 JSON 对象。"""
     if not text:
@@ -835,8 +906,8 @@ def main():
                         st.rerun()
 
     # ---------------- 主界面 Tabs ----------------
-    tab_decision, tab_add, tab_chip, tab_data = st.tabs(
-        ["🎯 今日操作建议", "🛡️ 加自选股", "🖼️ 上传筹码图", "📊 详细数据表"]
+    tab_decision, tab_add, tab_miner, tab_chip, tab_data = st.tabs(
+        ["🎯 今日操作建议", "🛡️ 加自选股", "🕵️‍♂️ 赛道挖掘机", "🖼️ 上传筹码图", "📊 详细数据表"]
     )
 
     # ===== Tab1：今日操作建议（主页） =====
@@ -987,6 +1058,66 @@ def main():
                 else:
                     st.error(err)
 
+    # ===== Tab(新)：AI 热门赛道紫苏叶挖掘机（主动选股） =====
+    with tab_miner:
+        st.subheader("🕵️‍♂️ AI 热门赛道紫苏叶挖掘机")
+        st.caption("不用你想买啥。点一下，AI 自动扫描当下最火的几个硬科技赛道（固态电池、低空经济、商业航天、合成生物…），"
+                   "在每个赛道里用『紫苏叶理论』挖出那条别人离不开、卡脖子、玩家极少的底层环节，并推荐对应的 A 股。")
+
+        if st.button("🤖 扫描全市场热门赛道，挖掘紫苏叶", type="primary", use_container_width=True):
+            with st.spinner("AI 正在跨赛道深度挖掘（思维链较慢，约需 30–90 秒）…"):
+                ok, data, err = call_deepseek_miner(deepseek_key, deepseek_model)
+            if not ok:
+                st.session_state.pop("miner_result", None)
+                st.error(err)
+            else:
+                st.session_state["miner_result"] = data.get("sectors", [])
+
+        sectors = st.session_state.get("miner_result")
+        if sectors is not None:
+            if not sectors:
+                st.warning("这次没挖到合适的标的，请再点一次试试。")
+            else:
+                # 已入池代码，用来判断哪些已经收编过
+                _pool_df = load_pool_df()
+                pooled = set(_pool_df["code"].astype(str).tolist()) if not _pool_df.empty else set()
+                st.success(f"挖掘完成！AI 扫描出 {len(sectors)} 个热门赛道，结果如下：")
+                st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局可能有误，收编前请自行核对。")
+                for si, sec in enumerate(sectors):
+                    sname = sec.get("sector", "未知赛道")
+                    with st.expander(f"🔥 {sname}", expanded=True):
+                        if sec.get("logic"):
+                            st.markdown(f"**赛道紫苏叶逻辑：** {sec.get('logic')}")
+                        for sti, stk in enumerate(sec.get("stocks", [])):
+                            name = stk.get("name") or ""
+                            code = str(stk.get("code") or "")
+                            st.markdown(
+                                f"<div style='background:#f6f9ff;border:1px solid #d6e4ff;"
+                                f"border-radius:10px;padding:12px 14px;margin:8px 0;'>"
+                                f"<div style='font-size:17px;font-weight:800;color:#1a3c8c;'>"
+                                f"📌 {name}（{code}）</div>"
+                                f"<div style='margin-top:6px;line-height:1.6;'>"
+                                f"<b>卡脖子/底层节点：</b>{stk.get('bottleneck','—')}<br>"
+                                f"<b>主要竞争对手：</b>{stk.get('competitors','—')}<br>"
+                                f"<b>紫苏叶理由：</b>{stk.get('reason','—')}</div></div>",
+                                unsafe_allow_html=True,
+                            )
+                            already = code in pooled
+                            btn_key = f"mine_add_{si}_{sti}_{code}"
+                            if already:
+                                st.caption(f"✅ 『{name}』已在你的股票池里。")
+                            elif not code:
+                                st.caption("（缺少股票代码，无法一键收编）")
+                            else:
+                                if st.button(f"➕ 一键收编入库：{name}", key=btn_key):
+                                    reason = (f"【AI赛道挖掘·{sname}】卡脖子节点：{stk.get('bottleneck','')}；"
+                                              f"竞争对手：{stk.get('competitors','')}；"
+                                              f"{stk.get('reason','')}")
+                                    upsert_stock(code, name or code, True, reason)
+                                    st.success(f"已把 {name}({code}) 收编入池！请到左侧『🔄 一键刷新全池数据』拉行情，"
+                                               "再到『🖼️ 上传筹码图』补筹码。")
+                                    st.rerun()
+
     # ===== Tab3：上传筹码图（视觉分析） =====
     with tab_chip:
         st.subheader("🖼️ 上传筹码分布图 —— AI 帮你看图")
@@ -1000,6 +1131,17 @@ def main():
                 format_func=lambda c: f"{df_chip[df_chip['code']==c]['name'].values[0]}({c})",
                 key="chip_sel",
             )
+            # 当前股票在库里的数据（手动录入表单用来预填）
+            cur = df_chip[df_chip["code"] == sel].iloc[0]
+
+            def _cur_num(col):
+                """取当前库里的数值；没有则返回 None（输入框留空）。"""
+                v = cur.get(col)
+                try:
+                    return float(v) if v is not None and pd.notna(v) else None
+                except Exception:
+                    return None
+
             up = st.file_uploader("上传筹码分布图（png/jpg）", type=["png", "jpg", "jpeg"])
             if up is not None:
                 # 分析按钮紧挨上传框，放在图片预览上方，省得上传后还要往下滚很久
@@ -1060,13 +1202,55 @@ def main():
                         if img_data["close"] is None or img_data["ma30"] is None:
                             st.info("提示：这张图里没读全『现价/均线』数字。如果你的图上有这些数字，请换一张更清晰、能看到现价和均线数值的截图，系统就能直接给出买卖建议。")
 
+                # ===== ✍️ 手动录入关键数据（紧挨分析按钮，AI 读图失败 / akshare 抓不到时用）=====
+                with st.expander("✍️ 手动录入关键数据（AI 没读出或 akshare 没抓到时，自己填）", expanded=False):
+                    st.caption("如市盈率 PE、均线等数字 AI 没读出来、akshare 也没抓到，可在这里自己填。"
+                               "**留空的格子不会改动原有数据**；填了的会直接覆盖保存。")
+                    with st.form("manual_data_form"):
+                        fa, fb, fc = st.columns(3)
+                        with fa:
+                            in_close = st.number_input("收盘价", value=_cur_num("close"), step=0.01, format="%.2f")
+                            in_ma10 = st.number_input("MA10（10日均价）", value=_cur_num("ma10"), step=0.01, format="%.2f")
+                            in_ma20 = st.number_input("MA20（20日均价）", value=_cur_num("ma20"), step=0.01, format="%.2f")
+                            in_ma30 = st.number_input("MA30（30日均价）", value=_cur_num("ma30"), step=0.01, format="%.2f")
+                        with fb:
+                            in_pe = st.number_input("市盈率 PE", value=_cur_num("pe"), step=0.01, format="%.2f")
+                            in_pepct = st.number_input("PE近3年分位（%）", value=_cur_num("pe_percentile"), step=0.1, format="%.1f")
+                            in_npr = st.number_input("净利润同比增长（%）", value=_cur_num("npr_growth"), step=0.1, format="%.1f")
+                            in_avg = st.number_input("平均成本", value=_cur_num("avg_cost"), step=0.01, format="%.2f")
+                        with fc:
+                            in_profit = st.number_input("获利比例（%）", value=_cur_num("profit_ratio"), step=0.1, format="%.1f")
+                            in_lhb = st.number_input("龙虎榜净买入（万元，净卖出填负）", value=_cur_num("lhb_net"), step=1.0, format="%.0f")
+                            in_m1 = st.number_input("今日主力净流入（亿元，净流出填负）", value=_cur_num("main_net_today"), step=0.01, format="%.2f")
+                            in_m5 = st.number_input("近5日主力净流入（亿元，净流出填负）", value=_cur_num("main_net_5d"), step=0.01, format="%.2f")
+                        in_margin = st.number_input("融资余额变化（%，减少填负）", value=_cur_num("margin_chg"), step=0.01, format="%.2f")
+
+                        submitted = st.form_submit_button("💾 保存手动录入的数据", type="primary")
+                        if submitted:
+                            mapping = {
+                                "close": in_close, "ma10": in_ma10, "ma20": in_ma20, "ma30": in_ma30,
+                                "pe": in_pe, "pe_percentile": in_pepct, "npr_growth": in_npr,
+                                "avg_cost": in_avg, "profit_ratio": in_profit, "lhb_net": in_lhb,
+                                "main_net_today": in_m1, "main_net_5d": in_m5, "margin_chg": in_margin,
+                            }
+                            # 只保存"填了"的格子（留空=None=不改动）
+                            to_save = {k: v for k, v in mapping.items() if v is not None}
+                            if not to_save:
+                                st.warning("你没有填写任何数字。")
+                            else:
+                                # 填了龙虎榜净额，顺手把"上龙虎榜"标记打上
+                                if "lhb_net" in to_save:
+                                    to_save["lhb_flag"] = 1
+                                update_fields(sel, to_save)
+                                st.success(f"已手动保存 {len(to_save)} 项数据，将直接参与买卖决策。"
+                                           "可到『🎯 今日操作建议』查看更新后的结论。")
+
                 # 图片预览放在按钮/结果下方，作为参考
                 st.image(up, caption="你上传的筹码图", use_container_width=True)
 
             # 人工修正区（人工值优先于模型值）
             st.divider()
             st.markdown("##### ✍️ 人工修正（若你觉得 AI 看错了，可在此手动调整）")
-            cur = df_chip[df_chip["code"] == sel].iloc[0]
             mc1, mc2, mc3 = st.columns(3)
             with mc1:
                 m_single = st.checkbox("低位单峰密集", value=bool(cur["chip_single_peak"]), key="m_single")
