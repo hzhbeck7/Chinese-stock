@@ -70,7 +70,10 @@ def current_db_path():
         base = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base, f"perilla_stock_{_safe_user_key(user)}.db")
     return DB_PATH
-HTTP_TIMEOUT = 30             # 网络请求超时（秒）
+HTTP_TIMEOUT = 30             # 一般网络请求超时（秒）
+# DeepSeek 大模型回答较慢，用 (连接超时, 读取超时)：连接 15 秒、读取 180 秒
+DEEPSEEK_TIMEOUT = (15, 180)
+DEEPSEEK_RETRIES = 2          # 超时/网络抖动时自动重试次数
 
 # 操作指令的展示样式：emoji + 中文标签 + 卡片背景色
 SIGNAL_STYLE = {
@@ -281,6 +284,35 @@ PERILLA_SYSTEM_PROMPT = """你是一位顶级的A股硬科技产业链研究专�
 """
 
 
+def _deepseek_post(payload, api_key, timeout=DEEPSEEK_TIMEOUT, retries=DEEPSEEK_RETRIES):
+    """
+    统一的 DeepSeek 请求封装：带较长读取超时 + 超时自动重试。
+    成功返回 (True, content_str, "")；失败返回 (False, None, err_msg)。
+    """
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    last_err = ""
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code != 200:
+                return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
+            content = resp.json()["choices"][0]["message"]["content"]
+            return True, content, ""
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            # 超时或连接抖动：还有机会就重试，否则报告
+            last_err = ("调用 DeepSeek 超时" if isinstance(e, requests.exceptions.Timeout)
+                        else "连接 DeepSeek 失败")
+            if attempt < retries:
+                continue
+            return False, None, f"{last_err}（已重试{retries}次）。请检查网络后再试，或稍后重试。"
+        except requests.exceptions.RequestException as e:
+            return False, None, f"网络请求异常：{e}"
+        except Exception as e:
+            return False, None, f"未知错误：{e}"
+    return False, None, last_err or "调用 DeepSeek 失败。"
+
+
 def call_deepseek_gatekeeper(api_key, model, user_input):
     """
     调用 DeepSeek 进行紫苏叶研判。
@@ -290,8 +322,6 @@ def call_deepseek_gatekeeper(api_key, model, user_input):
     if not api_key:
         return False, None, "未填写 DeepSeek API Key（请在左侧边栏填写）。"
 
-    url = "https://api.deepseek.com/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model or "deepseek-chat",
         "messages": [
@@ -302,21 +332,13 @@ def call_deepseek_gatekeeper(api_key, model, user_input):
         "response_format": {"type": "json_object"},
         "stream": False,
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
-        content = resp.json()["choices"][0]["message"]["content"]
-        data = _safe_parse_json(content)
-        if data is None or "is_perilla_leaf" not in data:
-            return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
-        return True, data, ""
-    except requests.exceptions.Timeout:
-        return False, None, "调用 DeepSeek 超时，请检查网络后重试。"
-    except requests.exceptions.RequestException as e:
-        return False, None, f"网络请求异常：{e}"
-    except Exception as e:
-        return False, None, f"未知错误：{e}"
+    ok, content, err = _deepseek_post(payload, api_key)
+    if not ok:
+        return False, None, err
+    data = _safe_parse_json(content)
+    if data is None or "is_perilla_leaf" not in data:
+        return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
+    return True, data, ""
 
 
 PERILLA_AGENT_PROMPT = """你是一位顶级的A股硬科技产业链投研 Agent，精通"紫苏叶理论"，并以多轮对话的方式和用户协作选股。
@@ -360,8 +382,6 @@ def call_deepseek_agent(api_key, model, history):
     """
     if not api_key:
         return False, None, "未填写 DeepSeek API Key（请在左侧边栏填写）。"
-    url = "https://api.deepseek.com/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     messages = [{"role": "system", "content": PERILLA_AGENT_PROMPT}]
     messages.extend(history)
     payload = {
@@ -371,21 +391,13 @@ def call_deepseek_agent(api_key, model, history):
         "response_format": {"type": "json_object"},
         "stream": False,
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
-        content = resp.json()["choices"][0]["message"]["content"]
-        data = _safe_parse_json(content)
-        if data is None or "reply" not in data:
-            return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
-        return True, data, ""
-    except requests.exceptions.Timeout:
-        return False, None, "调用 DeepSeek 超时，请检查网络后重试。"
-    except requests.exceptions.RequestException as e:
-        return False, None, f"网络请求异常：{e}"
-    except Exception as e:
-        return False, None, f"未知错误：{e}"
+    ok, content, err = _deepseek_post(payload, api_key)
+    if not ok:
+        return False, None, err
+    data = _safe_parse_json(content)
+    if data is None or "reply" not in data:
+        return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
+    return True, data, ""
 
 
 PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专家，精通"紫苏叶理论"，现在要主动跨赛道为用户挖掘潜力股。
@@ -429,8 +441,6 @@ def call_deepseek_miner(api_key, model):
     """
     if not api_key:
         return False, None, "未填写 DeepSeek API Key（请在左侧边栏填写）。"
-    url = "https://api.deepseek.com/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model or "deepseek-chat",
         "messages": [
@@ -441,22 +451,14 @@ def call_deepseek_miner(api_key, model):
         "response_format": {"type": "json_object"},
         "stream": False,
     }
-    try:
-        # 思维链较长，给更宽的超时
-        resp = requests.post(url, headers=headers, json=payload, timeout=max(HTTP_TIMEOUT, 90))
-        if resp.status_code != 200:
-            return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
-        content = resp.json()["choices"][0]["message"]["content"]
-        data = _safe_parse_json(content)
-        if data is None or "sectors" not in data:
-            return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
-        return True, data, ""
-    except requests.exceptions.Timeout:
-        return False, None, "调用 DeepSeek 超时（思维链较慢），请重试。"
-    except requests.exceptions.RequestException as e:
-        return False, None, f"网络请求异常：{e}"
-    except Exception as e:
-        return False, None, f"未知错误：{e}"
+    # 思维链较长，给更宽的读取超时
+    ok, content, err = _deepseek_post(payload, api_key, timeout=(15, 240))
+    if not ok:
+        return False, None, err
+    data = _safe_parse_json(content)
+    if data is None or "sectors" not in data:
+        return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
+    return True, data, ""
 
 
 def _safe_parse_json(text):
