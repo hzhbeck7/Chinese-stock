@@ -825,10 +825,10 @@ def render_signal_card(row, signal_key, reason):
         f"""
         <div style="background:{style['color']};color:{style['text']};
                     padding:18px 20px;border-radius:14px;margin-bottom:14px;">
-          <div style="font-size:22px;font-weight:800;">
+          <div class="perilla-card-title" style="font-size:22px;font-weight:800;">
             {style['emoji']} {name} {code} {hold_tag}{override_tag} —— {signal_key}
           </div>
-          <div style="font-size:16px;margin-top:8px;line-height:1.6;">{reason}</div>
+          <div class="perilla-card-reason" style="font-size:16px;margin-top:8px;line-height:1.6;">{reason}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -843,11 +843,73 @@ def fmt(v, suffix=""):
 
 
 def main():
-    st.set_page_config(page_title="紫苏叶 AI 投研系统", page_icon="🌿", layout="wide")
+    st.set_page_config(
+        page_title="紫苏叶 AI 投研系统",
+        page_icon="🌿",
+        layout="wide",
+        initial_sidebar_state="collapsed",  # 手机上默认收起侧边栏，先看正文
+    )
     init_db()
 
+    # ---------------- 手机端友好的响应式样式 ----------------
+    st.markdown(
+        """
+        <style>
+        /* 通用：内容区留白收紧一点，手机上不浪费空间 */
+        .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
+
+        /* 按钮更大更好按（触摸友好），文字不换行挤压 */
+        .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+            min-height: 44px;
+            border-radius: 10px;
+            font-size: 16px;
+        }
+
+        /* 标签页可横向滑动，5个tab在手机上不被压扁 */
+        div[data-baseweb="tab-list"] { overflow-x: auto; flex-wrap: nowrap; }
+        button[data-baseweb="tab"] { white-space: nowrap; }
+
+        /* 表格在窄屏可左右滑动查看 */
+        div[data-testid="stDataFrame"] { overflow-x: auto; }
+
+        /* ====== 手机屏幕（宽度 <= 640px）专属优化 ====== */
+        @media (max-width: 640px) {
+            /* 内容贴边一点，争取更多可视宽度 */
+            .block-container { padding-left: 0.8rem; padding-right: 0.8rem; padding-top: 0.8rem; }
+
+            /* 标题缩小，避免占满整屏 */
+            h1 { font-size: 1.45rem !important; line-height: 1.3 !important; }
+            h2 { font-size: 1.2rem !important; }
+            h3 { font-size: 1.05rem !important; }
+
+            /* 关键：让并排的列在手机上自动竖向堆叠，不再左右挤成一团 */
+            div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
+            div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+                flex: 1 1 100% !important;
+                width: 100% !important;
+                min-width: 100% !important;
+            }
+
+            /* 所有按钮在手机上占满整行，方便单手点 */
+            .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+                width: 100% !important;
+            }
+
+            /* 大色块操作卡片：标题字号略缩，照样醒目 */
+            .perilla-card-title { font-size: 18px !important; }
+            .perilla-card-reason { font-size: 15px !important; }
+
+            /* 输入框/下拉字号 16px，避免 iOS Safari 自动放大页面 */
+            input, textarea, select { font-size: 16px !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("🌿 硬科技【紫苏叶 AI 投研与综合择时系统】")
-    st.caption("找到产业链最底层、别人离不开的好公司，在合适的时机告诉你该买、该卖还是该等。")
+    st.caption("找到产业链最底层、别人离不开的好公司，在合适的时机告诉你该买、该卖还是该等。"
+               "📱 手机用户：点左上角 » 可展开『设置/API Key』。")
 
     # ---------------- 侧边栏 ----------------
     with st.sidebar:
