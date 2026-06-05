@@ -874,13 +874,19 @@ def main():
 
         /* ====== 手机屏幕（宽度 <= 640px）专属优化 ====== */
         @media (max-width: 640px) {
-            /* 内容贴边一点，争取更多可视宽度 */
-            .block-container { padding-left: 0.8rem; padding-right: 0.8rem; padding-top: 0.8rem; }
+            /* 内容贴边一点，争取更多可视宽度；顶部多留点空，标题不顶到工具栏 */
+            .block-container { padding-left: 0.8rem; padding-right: 0.8rem; padding-top: 1.6rem; }
 
-            /* 标题缩小，避免占满整屏 */
-            h1 { font-size: 1.45rem !important; line-height: 1.3 !important; }
-            h2 { font-size: 1.2rem !important; }
-            h3 { font-size: 1.05rem !important; }
+            /* 标题缩小，避免占满整屏；line-height 放宽 + 留上边距，防止中文字顶部被裁切 */
+            h1 {
+                font-size: 1.4rem !important;
+                line-height: 1.55 !important;
+                padding-top: 0.4rem !important;
+                margin-top: 0.2rem !important;
+                overflow: visible !important;
+            }
+            h2 { font-size: 1.2rem !important; line-height: 1.5 !important; }
+            h3 { font-size: 1.05rem !important; line-height: 1.5 !important; }
 
             /* 关键：让并排的列在手机上自动竖向堆叠，不再左右挤成一团 */
             div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
