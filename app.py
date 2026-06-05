@@ -60,6 +60,7 @@ SIGNAL_STYLE = {
     "只看不动观望": {"emoji": "🟡", "color": "#f1c40f", "text": "#5a4b00"},
     "坚决清仓卖出": {"emoji": "🔴", "color": "#e74c3c", "text": "#ffffff"},
     "待补充筹码数据": {"emoji": "🟤", "color": "#95a5a6", "text": "#ffffff"},
+    "待刷新行情数据": {"emoji": "🟠", "color": "#e67e22", "text": "#ffffff"},
 }
 
 
@@ -261,29 +262,36 @@ def _get_akshare():
 def fetch_price_ma(code):
     """
     拉取日线行情，计算最新收盘价与 MA10/MA20/MA30。
-    返回 dict 或含 MISSING 的 dict。带缓存（30分钟）。
+    成功返回 dict；失败则抛出异常（注意：Streamlit 不会缓存抛异常的结果，
+    因此下次点『刷新』会自动重试，而不会被旧的失败结果卡住）。
     """
     ak = _get_akshare()
-    result = {"close": None, "ma10": None, "ma20": None, "ma30": None}
     if ak is None:
-        return result
-    try:
-        # 取最近约半年日线，前复权
-        end = datetime.date.today().strftime("%Y%m%d")
-        start = (datetime.date.today() - datetime.timedelta(days=200)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=start, end_date=end, adjust="qfq")
-        if df is None or df.empty:
-            return result
-        df = df.sort_values("日期")
-        close = df["收盘"].astype(float)
-        result["close"] = round(float(close.iloc[-1]), 2)
-        result["ma10"] = round(float(close.rolling(10).mean().iloc[-1]), 2) if len(close) >= 10 else None
-        result["ma20"] = round(float(close.rolling(20).mean().iloc[-1]), 2) if len(close) >= 20 else None
-        result["ma30"] = round(float(close.rolling(30).mean().iloc[-1]), 2) if len(close) >= 30 else None
-    except Exception:
-        return result
-    return result
+        raise RuntimeError("akshare 未安装")
+
+    end = datetime.date.today().strftime("%Y%m%d")
+    start = (datetime.date.today() - datetime.timedelta(days=200)).strftime("%Y%m%d")
+    last_err = "未知原因"
+    # 网络可能抽风，最多重试 3 次
+    for _ in range(3):
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily",
+                                    start_date=start, end_date=end, adjust="qfq")
+            if df is None or df.empty:
+                last_err = "接口返回空数据"
+                continue
+            df = df.sort_values("日期")
+            close = df["收盘"].astype(float)
+            return {
+                "close": round(float(close.iloc[-1]), 2),
+                "ma10": round(float(close.rolling(10).mean().iloc[-1]), 2) if len(close) >= 10 else None,
+                "ma20": round(float(close.rolling(20).mean().iloc[-1]), 2) if len(close) >= 20 else None,
+                "ma30": round(float(close.rolling(30).mean().iloc[-1]), 2) if len(close) >= 30 else None,
+            }
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"行情数据获取失败：{last_err}")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -347,8 +355,16 @@ def fetch_pe_percentile(code):
     ak = _get_akshare()
     if ak is None:
         return None, None
+    df = None
+    for _ in range(2):  # legulegu 源不稳，重试 2 次
+        try:
+            df = ak.stock_a_indicator_lg(symbol=code)  # legulegu 历史估值
+            if df is not None and not df.empty:
+                break
+        except Exception:
+            df = None
+            continue
     try:
-        df = ak.stock_a_indicator_lg(symbol=code)  # legulegu 历史估值
         if df is None or df.empty:
             return None, None
         # 找到 PE 列与日期列
@@ -413,10 +429,14 @@ def refresh_one_stock(code):
     """拉取并写入单只股票的全部行情/财务/龙虎榜数据，单项失败不影响其他项。"""
     fields = {}
 
-    # 行情与均线
-    ma = fetch_price_ma(code)
-    for k in ("close", "ma10", "ma20", "ma30"):
-        fields[k] = ma.get(k)
+    # 行情与均线（失败不写入，留空显示"数据缺失"；因抛异常未被缓存，下次刷新会重试）
+    try:
+        ma = fetch_price_ma(code)
+        for k in ("close", "ma10", "ma20", "ma30"):
+            fields[k] = ma.get(k)
+    except Exception:
+        for k in ("close", "ma10", "ma20", "ma30"):
+            fields[k] = None
 
     # 净利润同比增长
     fields["npr_growth"] = fetch_npr_growth(code)
@@ -508,9 +528,9 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
     high_diverge = bool(row.get("chip_high_diverge")) if has_chip else False
     single_peak = bool(row.get("chip_single_peak")) if has_chip else False
 
-    # 行情数据缺失，无法判断
+    # 行情数据缺失，无法判断（注意：这跟筹码图无关，是股价/均线没拉到）
     if close is None or ma30 is None:
-        return "待补充筹码数据", "行情数据还没拉取到（请点左侧『一键刷新』），暂时无法给出建议。"
+        return "待刷新行情数据", "股价/均线数据还没拉到（可能是刚才网络抽风）。请点左侧『🔄 一键刷新全池数据』再试一次，通常重试就好。"
 
     # 1) 持仓者破位风控（最高优先）
     if is_holding and (close < ma30 or high_diverge):
@@ -656,7 +676,8 @@ def main():
         else:
             # 卖出/强烈买入优先排在最前面，方便用户第一眼看到
             order = {"坚决清仓卖出": 0, "强烈买入": 1, "分批建仓买入": 2,
-                     "持有移动止盈": 3, "只看不动观望": 4, "待补充筹码数据": 5}
+                     "持有移动止盈": 3, "只看不动观望": 4, "待补充筹码数据": 5,
+                     "待刷新行情数据": 6}
             cards = []
             for _, r in df.iterrows():
                 row = dict(r)
