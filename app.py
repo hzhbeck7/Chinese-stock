@@ -21,6 +21,8 @@
 """
 
 import os
+import re
+import hmac
 import json
 import sqlite3
 import datetime
@@ -48,8 +50,26 @@ except Exception:
 # 模块0：基础设施（数据库、常量、网络容错）
 # ============================================================================
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perilla_stock.db")  # SQLite 数据库文件
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perilla_stock.db")  # 默认（未登录）数据库文件
 MISSING = "数据缺失"          # 取数失败时的统一占位
+
+
+def _safe_user_key(username: str) -> str:
+    """把用户名转成安全的文件名片段（只保留字母/数字/下划线，其余替换为下划线）。"""
+    safe = re.sub(r"[^0-9A-Za-z_]", "_", (username or "").strip())
+    return safe or "user"
+
+
+def current_db_path():
+    """
+    返回"当前登录用户专属"的数据库文件路径，实现『每个人各看各的股票池』。
+    未登录时回退到默认库。每个用户一个独立的 .db 文件，互不可见。
+    """
+    user = st.session_state.get("auth_user")
+    if user:
+        base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, f"perilla_stock_{_safe_user_key(user)}.db")
+    return DB_PATH
 HTTP_TIMEOUT = 30             # 网络请求超时（秒）
 
 # 操作指令的展示样式：emoji + 中文标签 + 卡片背景色
@@ -65,8 +85,8 @@ SIGNAL_STYLE = {
 
 
 def init_db():
-    """初始化数据库，创建股票池表（若不存在）。"""
-    conn = sqlite3.connect(DB_PATH)
+    """初始化数据库，创建股票池表（若不存在）。库文件按登录用户隔离。"""
+    conn = sqlite3.connect(current_db_path())
     cur = conn.cursor()
     cur.execute(
         """
@@ -109,13 +129,48 @@ def init_db():
             cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
         except Exception:
             pass
+    # 个人设置表（用于记住该用户的 API Key、模型名等，键值对存储）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            k TEXT PRIMARY KEY,   -- 设置项名称
+            v TEXT                -- 设置项的值
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
+def save_setting(key, value):
+    """保存（或覆盖）一个个人设置项到当前用户专属数据库。"""
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO app_settings (k, v) VALUES (?, ?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, "" if value is None else str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_setting(key, default=""):
+    """读取一个个人设置项；不存在时返回 default。"""
+    conn = db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT v FROM app_settings WHERE k=?", (key,))
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    conn.close()
+    return row[0] if row and row[0] is not None else default
+
+
 def db_conn():
-    """返回数据库连接（行可按列名访问）。"""
-    conn = sqlite3.connect(DB_PATH)
+    """返回数据库连接（行可按列名访问）。库文件按登录用户隔离。"""
+    conn = sqlite3.connect(current_db_path())
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -852,6 +907,57 @@ def fmt(v, suffix=""):
     return f"{v}{suffix}"
 
 
+def check_login():
+    """
+    登录闸门：未登录就显示登录框并 st.stop()（后面的内容都不会运行）；
+    登录成功返回用户名。
+    账号密码存放在 Streamlit 的 Secrets（st.secrets["passwords"]）里，
+    格式为 [passwords] 区段下『用户名 = "密码"』，这样密码不会出现在公开代码里。
+    """
+    # 已登录 → 直接放行
+    if st.session_state.get("auth_ok"):
+        return st.session_state.get("auth_user")
+
+    # 读取凭据库（来自 Secrets）
+    try:
+        creds = dict(st.secrets["passwords"])
+    except Exception:
+        creds = {}
+
+    st.title("🌿 紫苏叶 AI 投研系统 · 登录")
+
+    # 还没配置任何账号 → 给出小白可照做的指引
+    if not creds:
+        st.error("⚠️ 系统还没有配置任何登录账号，暂时无法使用。")
+        st.markdown(
+            "**管理员设置方法（一次性）：**\n\n"
+            "- 在线版（Streamlit Cloud）：进入 App 的 **Settings → Secrets**，粘贴下面这段，"
+            "把用户名/密码改成你要的：\n\n"
+            "```toml\n[passwords]\n小明 = \"my-password-123\"\n小红 = \"another-pass-456\"\n```\n\n"
+            "- 本地电脑测试：在项目里新建文件 `.streamlit/secrets.toml`，写入同样的内容。\n\n"
+            "保存后刷新本页即可登录。每个账号登录后只能看到自己的股票池和自己填的 API Key。"
+        )
+        st.stop()
+
+    with st.form("login_form"):
+        username = st.text_input("用户名")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+
+    if submitted:
+        real = creds.get(username)
+        # 用 hmac.compare_digest 做恒定时间比较，避免泄露密码长度等信息
+        if real is not None and hmac.compare_digest(str(real), str(password)):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = username
+            st.rerun()
+        else:
+            st.error("用户名或密码不对，请重试。")
+
+    st.caption("🔒 这是私人系统，登录后每个人只能看到自己的股票池和自己填写的 API Key，互不可见。")
+    st.stop()
+
+
 def main():
     st.set_page_config(
         page_title="紫苏叶 AI 投研系统",
@@ -859,7 +965,11 @@ def main():
         layout="wide",
         initial_sidebar_state="collapsed",  # 手机上默认收起侧边栏，先看正文
     )
-    init_db()
+
+    # 登录闸门：未登录会在此显示登录框并停下，下面的代码都不会执行
+    auth_user = check_login()
+
+    init_db()  # 注意：此时已登录，建/连的是该用户专属的数据库
 
     # ---------------- 手机端友好的响应式样式 ----------------
     st.markdown(
@@ -929,16 +1039,51 @@ def main():
 
     # ---------------- 侧边栏 ----------------
     with st.sidebar:
+        # 当前登录用户 + 退出登录
+        st.success(f"👤 当前用户：**{auth_user}**")
+        if st.button("🚪 退出登录", use_container_width=True):
+            for k in ("auth_ok", "auth_user"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        st.divider()
+
         st.header("⚙️ 设置")
         st.subheader("AI 钥匙（API Key）")
-        deepseek_key = st.text_input("DeepSeek API Key", type="password",
-                                     help="用于『AI 选股研判』。从 deepseek.com 申请。只存在本次会话，不会保存到文件。")
-        deepseek_model = st.text_input("DeepSeek 模型名", value="deepseek-chat",
+
+        # 读取该用户上次"记住"的钥匙作为默认值，实现登录后自动填好、无需重输
+        saved_ds_key = load_setting("deepseek_key", "")
+        saved_ds_model = load_setting("deepseek_model", "deepseek-chat")
+        saved_gm_key = load_setting("gemini_key", "")
+        saved_gm_model = load_setting("gemini_model", "gemini-1.5-flash")
+        has_saved_keys = bool(saved_ds_key or saved_gm_key)
+
+        deepseek_key = st.text_input("DeepSeek API Key", value=saved_ds_key, type="password",
+                                     help="用于『AI 选股研判』。从 deepseek.com 申请。")
+        deepseek_model = st.text_input("DeepSeek 模型名", value=saved_ds_model,
                                        help="一般保持默认即可。")
-        gemini_key = st.text_input("Gemini API Key", type="password",
-                                   help="用于『筹码分布图』看图分析。从 Google AI Studio 申请。只存在本次会话。")
-        gemini_model = st.text_input("Gemini 模型名", value="gemini-1.5-flash",
+        gemini_key = st.text_input("Gemini API Key", value=saved_gm_key, type="password",
+                                   help="用于『筹码分布图』看图分析。从 Google AI Studio 申请。")
+        gemini_model = st.text_input("Gemini 模型名", value=saved_gm_model,
                                      help="一般保持默认即可。")
+
+        remember_keys = st.checkbox("💾 记住我的钥匙（下次登录自动填好）", value=has_saved_keys,
+                                    help="勾选并点下方按钮后，钥匙会保存在你专属的本地数据库里，下次登录自动填好，无需重输。")
+        if st.button("保存钥匙设置", use_container_width=True):
+            if remember_keys:
+                save_setting("deepseek_key", deepseek_key)
+                save_setting("deepseek_model", deepseek_model)
+                save_setting("gemini_key", gemini_key)
+                save_setting("gemini_model", gemini_model)
+                st.success("已记住，下次登录会自动填好。")
+            else:
+                # 取消记住 → 清空已保存的钥匙
+                for _k in ("deepseek_key", "gemini_key"):
+                    save_setting(_k, "")
+                st.success("已清除保存的钥匙，下次登录需重新输入。")
+            st.rerun()
+
+        if has_saved_keys:
+            st.caption("🔒 钥匙仅保存在你专属的本地数据库文件中（不会上传到公开仓库，别人看不到）。")
 
         st.divider()
         st.subheader("买入参数（可调）")

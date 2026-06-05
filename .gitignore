@@ -3,6 +3,9 @@
 # 本地数据库（你自己电脑上的股票池数据，不用上传）
 *.db
 
+# 登录密码 / API 等机密（绝对不能上传到公开仓库！）
+.streamlit/secrets.toml
+
 # Python 缓存
 __pycache__/
 *.pyc
