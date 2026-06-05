@@ -612,28 +612,38 @@ def refresh_one_stock(code):
     """拉取并写入单只股票的全部行情/财务/龙虎榜数据，单项失败不影响其他项。"""
     fields = {}
 
-    # 行情与均线：akshare 成功就用 akshare 的（更准）；失败则【不覆盖】，
-    # 保留可能已由筹码图读出的备用数值。因抛异常未被缓存，下次刷新会自动重试。
+    # 通用原则：akshare 取到值就用（更准、会覆盖）；取不到（None）就【不写入】，
+    # 以免把筹码图读出的 / 你手动录入的数值清成空白。因抛异常未被缓存，下次刷新会自动重试。
+
+    # 行情与均线
     try:
         ma = fetch_price_ma(code)
         for k in ("close", "ma10", "ma20", "ma30"):
-            fields[k] = ma.get(k)
+            v = ma.get(k)
+            if v is not None:
+                fields[k] = v
     except Exception:
         pass
 
     # 净利润同比增长
-    fields["npr_growth"] = fetch_npr_growth(code)
+    npr = fetch_npr_growth(code)
+    if npr is not None:
+        fields["npr_growth"] = npr
 
-    # PE 与分位
+    # PE 与近3年分位
     pe, pe_pct = fetch_pe_percentile(code)
-    fields["pe"] = pe
-    fields["pe_percentile"] = pe_pct
+    if pe is not None:
+        fields["pe"] = pe
+    if pe_pct is not None:
+        fields["pe_percentile"] = pe_pct
 
-    # 龙虎榜
+    # 龙虎榜（取不到则不动原值）
     lhb = fetch_lhb_flag(code)
-    fields["lhb_flag"] = 1 if lhb else 0
+    if lhb is not None:
+        fields["lhb_flag"] = 1 if lhb else 0
 
-    update_fields(code, fields)
+    if fields:
+        update_fields(code, fields)
 
 
 # ============================================================================
