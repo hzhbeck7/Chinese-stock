@@ -90,10 +90,25 @@ def init_db():
             chip_confidence  REAL,               -- 视觉模型置信度（0-1）
             chip_manual      INTEGER DEFAULT 0,  -- 筹码结论是否被人工修正过
             has_chip         INTEGER DEFAULT 0,  -- 是否已有筹码分析结果
+            avg_cost         REAL,               -- 市场平均成本
+            profit_ratio     REAL,               -- 收盘获利比例（%）
+            lhb_net          REAL,               -- 龙虎榜净买入额（万元，净卖出为负）
+            main_net_today   REAL,               -- 今日主力（大单）净流入（亿元，净流出为负）
+            main_net_5d      REAL,               -- 近5日主力净流入（亿元，净流出为负）
+            margin_chg       REAL,               -- 融资融券余额较上一交易日变化（%）
+            is_override      INTEGER DEFAULT 0,  -- 是否人类强制收编（1=无视AI拒绝、手动纳入）
             updated_at       TEXT                -- 最后更新时间
         )
         """
     )
+    # 轻量迁移：给"老数据库"补上后来新增的列（列已存在会报错，忽略即可）
+    for col, typ in [("avg_cost", "REAL"), ("profit_ratio", "REAL"), ("lhb_net", "REAL"),
+                     ("main_net_today", "REAL"), ("main_net_5d", "REAL"), ("margin_chg", "REAL"),
+                     ("is_override", "INTEGER DEFAULT 0")]:
+        try:
+            cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -133,6 +148,34 @@ def upsert_stock(code, name, is_perilla, analysis):
         cur.execute(
             "INSERT INTO stock_pool (code, name, is_perilla_leaf, analysis, updated_at) VALUES (?,?,?,?,?)",
             (code, name, 1 if is_perilla else 0, analysis, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def force_add_stock(code, name, analysis):
+    """
+    👑 强制收编（上帝模式）：无视守门员的拒绝结论，强行把股票写入池子。
+    关键点：把 is_perilla_leaf 置 1，这样它能像普通入池股一样，
+    无障碍进入模块2(数据拉取)/模块3(筹码分析)/模块4(买卖决策)。
+    同时打上 is_override=1 标记，前端会显示"人类强制加入"。
+    """
+    conn = db_conn()
+    cur = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    note = ("【👑 人类强制收编】此股 AI 守门员判定『不符合紫苏叶标准』，"
+            "由用户手动强行纳入池子。AI 原始拒绝理由：" + (analysis or "（无）"))
+    cur.execute("SELECT code FROM stock_pool WHERE code=?", (code,))
+    if cur.fetchone():
+        cur.execute(
+            "UPDATE stock_pool SET name=?, is_perilla_leaf=1, is_override=1, analysis=?, updated_at=? WHERE code=?",
+            (name, note, now, code),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO stock_pool (code, name, is_perilla_leaf, is_override, analysis, updated_at) "
+            "VALUES (?, ?, 1, 1, ?, ?)",
+            (code, name, note, now),
         )
     conn.commit()
     conn.close()
@@ -211,6 +254,75 @@ def call_deepseek_gatekeeper(api_key, model, user_input):
         content = resp.json()["choices"][0]["message"]["content"]
         data = _safe_parse_json(content)
         if data is None or "is_perilla_leaf" not in data:
+            return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
+        return True, data, ""
+    except requests.exceptions.Timeout:
+        return False, None, "调用 DeepSeek 超时，请检查网络后重试。"
+    except requests.exceptions.RequestException as e:
+        return False, None, f"网络请求异常：{e}"
+    except Exception as e:
+        return False, None, f"未知错误：{e}"
+
+
+PERILLA_AGENT_PROMPT = """你是一位顶级的A股硬科技产业链投研 Agent，精通"紫苏叶理论"，并以多轮对话的方式和用户协作选股。
+
+【紫苏叶公司标准】（核心锚点业务需同时满足）：
+1. 处于产业链深层节点（Layer3 及以下：底层硬件、核心材料、关键设备等"卖水人"），而非终端品牌或应用层。
+2. 产品/技术不可替代，技术壁垒或专利护城河高。
+3. 寡头垄断格局（全球或国内有效竞争对手 <= 3 家）。
+
+【你的工作方式——非常重要】：
+不要拿一家公司的"总盘子业务"去一刀切地否定它。很多公司主业是红海（如汽车齿轮、消费电子组装），
+但其内部往往藏着一条符合紫苏叶特征的"核心零部件/隐藏业务"。你必须：
+1. 先在脑中拆解该公司的全部业务线；
+2. 主动过滤掉竞争激烈的红海业务；
+3. 主动挖掘其中最可能符合紫苏叶特征的细分业务/关键零部件，作为"紫苏叶锚点"；
+4. 然后用大白话向用户说明："主业XX是红海不达标，但发现隐藏的细分业务YY处于产业链底层、玩家极少，是否以YY作为紫苏叶锚点深度评估并入池？"
+5. 与用户探讨。用户若同意，就以该锚点入库；用户若说"逻辑不硬"或指出别的赛道，你要据其指示重新评估、另找锚点。
+6. 若整家公司确实找不到任何站得住脚的紫苏叶锚点，要如实告知，不要硬凑。
+
+【输出格式——必须严格遵守】：
+你每一轮都只返回一个 JSON 对象（不要任何额外文字、不要markdown代码块标记），字段如下：
+{
+ "reply": "要显示在聊天框里的大白话内容（这是用户唯一能看到的文字，要自然、口语化、像投研伙伴在跟小白聊天）",
+ "ready_to_add": true 或 false,   // 仅当『用户已明确同意以某锚点入池』时才为 true；否则一律 false
+ "code": "6位股票代码或 null",
+ "name": "公司中文简称或 null",
+ "anchor": "确认入池时的紫苏叶锚点业务名称（如 RV减速器）或 null",
+ "analysis": "确认入池时，用大白话总结『为什么锚定该细分业务它就算紫苏叶』，150字内；未入池则 null"
+}
+规则：
+- 第一次收到一个公司时，先做拆解+提出锚点建议并询问，ready_to_add 必须为 false。
+- 只有当最近一条用户消息表达了同意（如"同意""就按这个逻辑来""可以""加进去"）时，ready_to_add 才设为 true，并把 code/name/anchor/analysis 填全。
+- 用户否定或提出新方向时，ready_to_add 为 false，在 reply 里重新评估。
+"""
+
+
+def call_deepseek_agent(api_key, model, history):
+    """
+    多轮对话投研 Agent。history 为 [{"role":"user"/"assistant","content":...}] 列表。
+    返回 (ok, result_dict, err_msg)。result_dict 含 reply/ready_to_add/code/name/anchor/analysis。
+    """
+    if not api_key:
+        return False, None, "未填写 DeepSeek API Key（请在左侧边栏填写）。"
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": PERILLA_AGENT_PROMPT}]
+    messages.extend(history)
+    payload = {
+        "model": model or "deepseek-chat",
+        "messages": messages,
+        "temperature": 0.4,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            return False, None, f"DeepSeek 接口返回错误 {resp.status_code}：{resp.text[:200]}"
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = _safe_parse_json(content)
+        if data is None or "reply" not in data:
             return False, None, f"AI 返回内容无法解析为标准结果：{content[:200]}"
         return True, data, ""
     except requests.exceptions.Timeout:
@@ -429,14 +541,14 @@ def refresh_one_stock(code):
     """拉取并写入单只股票的全部行情/财务/龙虎榜数据，单项失败不影响其他项。"""
     fields = {}
 
-    # 行情与均线（失败不写入，留空显示"数据缺失"；因抛异常未被缓存，下次刷新会重试）
+    # 行情与均线：akshare 成功就用 akshare 的（更准）；失败则【不覆盖】，
+    # 保留可能已由筹码图读出的备用数值。因抛异常未被缓存，下次刷新会自动重试。
     try:
         ma = fetch_price_ma(code)
         for k in ("close", "ma10", "ma20", "ma30"):
             fields[k] = ma.get(k)
     except Exception:
-        for k in ("close", "ma10", "ma20", "ma30"):
-            fields[k] = None
+        pass
 
     # 净利润同比增长
     fields["npr_growth"] = fetch_npr_growth(code)
@@ -457,16 +569,30 @@ def refresh_one_stock(code):
 # 模块3：AI 视觉分析师（Gemini 筹码分布图分析）
 # ============================================================================
 
-CHIP_VISION_PROMPT = """你是一位精通筹码分布（成本分布）分析的A股技术专家。
-我会给你一张同花顺风格的"筹码分布图"。请分析后只返回一个 JSON 对象，不要任何额外文字、不要markdown标记：
+CHIP_VISION_PROMPT = """你是一位精通筹码分布（成本分布）与K线均线分析的A股技术专家。
+我会给你一张同花顺风格的图（通常含筹码分布、现价、均线等信息）。请仔细看图后，只返回一个 JSON 对象，
+不要任何额外文字、不要markdown标记。格式严格如下：
 {
  "is_single_peak_low": true 或 false,   // 是否为"低位单峰密集"（筹码高度集中在当前价附近的低位区域）
  "above_avg_cost": true 或 false,       // 当前股价是否站上了"平均成本线"
  "is_high_diverge": true 或 false,      // 是否为"高位发散"（筹码在高位分散、获利盘巨大、有派发风险）
+ "close_price": 数字 或 null,           // 图中显示的"最新价/现价/收盘价"，读不到就填 null
+ "ma10": 数字 或 null,                  // 图中10日均线（MA10/M10）的当前数值，看不清就填 null
+ "ma20": 数字 或 null,                  // 图中20日均线（MA20/M20）的当前数值，看不清就填 null
+ "ma30": 数字 或 null,                  // 图中30日均线（MA30/M30）的当前数值，看不清就填 null
+ "pe": 数字 或 null,                    // 图中"市盈/市盈TTM/PE"的数值，读不到就填 null
+ "avg_cost": 数字 或 null,              // 图中筹码区的"平均成本"，读不到就填 null
+ "profit_ratio": 数字 或 null,          // 图中"收盘获利比例/获利比例"的百分数（只要数字，如 100），读不到就填 null
+ "lhb_net_wan": 数字 或 null,           // 图中"龙虎榜净买入额"，单位万元，净卖出为负数（如 -6803）；图上没有就填 null
+ "main_net_today_yi": 数字 或 null,     // 图中"今日主力净流入/大单净流入/主力净额"，单位【亿元】，净流出为负数；图上没有就填 null
+ "main_net_5d_yi": 数字 或 null,        // 图中"近5日/5日主力净流入"，单位【亿元】，净流出为负数；图上没有就填 null
+ "margin_change_pct": 数字 或 null,     // 图中"融资融券余额"较上一交易日的变化百分比（只要数字，如 6.94 表示+6.94%；减少为负）；图上没有就填 null
  "confidence": 0.0 到 1.0 之间的小数,    // 你对本次判断的置信度
- "explain": "用大白话解释当前筹码状态，100字以内，让股票小白能看懂"
+ "explain": "用大白话解释当前筹码与均线状态，100字以内，让股票小白能看懂"
 }
-"""
+注意：所有数字请尽量读取图中标注的真实数值；价格/均线若只有线没数字，可结合纵轴价格刻度估算；实在判断不了才填 null。
+龙虎榜与资金金额注意正负号：净卖出/净流出/余额减少都要填负数。
+资金类数值（main_net_today_yi / main_net_5d_yi）统一换算成【亿元】；若图中是"万"，请除以10000换算成亿。"""
 
 
 def call_gemini_chip(api_key, model, image_bytes):
@@ -532,6 +658,10 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
     if close is None or ma30 is None:
         return "待刷新行情数据", "股价/均线数据还没拉到（可能是刚才网络抽风）。请点左侧『🔄 一键刷新全池数据』再试一次，通常重试就好。"
 
+    # 计算"高位追高风险"清单（用筹码获利比例 / 平均成本 / 龙虎榜净额）
+    risks = _high_position_risks(row, close)
+    high_risk = len(risks) > 0
+
     # 1) 持仓者破位风控（最高优先）
     if is_holding and (close < ma30 or high_diverge):
         if close < ma30:
@@ -547,8 +677,14 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
         if ma20 is not None and close > ma20 and close > ma30:
             # 站上均线，处于多头
             if is_holding:
-                return "持有移动止盈", f"股价（{close}）稳稳站在均价线之上，趋势健康，继续持有。移动止盈提示：跌破10日均价线（{row.get('ma10')}）可考虑减仓，跌破30日均价线（{ma30}）则清仓。"
+                tip = f"移动止盈提示：跌破10日均价线（{row.get('ma10')}）可考虑减仓，跌破30日均价线（{ma30}）则清仓。"
+                if high_risk:
+                    return "持有移动止盈", "趋势仍在均线之上，可继续持有，但要警惕高位风险：" + "；".join(risks) + "。" + tip
+                return "持有移动止盈", f"股价（{close}）稳稳站在均价线之上，趋势健康，继续持有。{tip}"
             else:
+                # 未持仓：高位则不建议追高买入（安全保护）
+                if high_risk:
+                    return "只看不动观望", "是符合紫苏叶标准的好公司，技术上也站上了均线，但【现在是高位，不建议追高买入】：" + "；".join(risks) + "。建议等股价回调到均线附近、获利盘消化后再考虑。"
                 davis = is_davis_double(row, npr_threshold, pe_pct_threshold)
                 if single_peak or davis:
                     why = []
@@ -567,6 +703,42 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
     return "只看不动观望", "暂不满足明确的买入或卖出条件，保持观望。"
 
 
+def _high_position_risks(row, close):
+    """根据 获利比例 / 平均成本 / 龙虎榜净额 / 主力资金流 / 融资变化，列出"高位追高"风险点（大白话）。"""
+    risks = []
+    profit = row.get("profit_ratio")
+    avg_cost = row.get("avg_cost")
+    lhb_net = row.get("lhb_net")
+    main_5d = row.get("main_net_5d")
+    margin_chg = row.get("margin_chg")
+    try:
+        if profit is not None and float(profit) >= 90:
+            risks.append(f"几乎全员获利（获利盘 {profit}%），随时可能有人获利了结")
+    except Exception:
+        pass
+    try:
+        if avg_cost and close and float(close) > float(avg_cost) * 1.20:
+            risks.append(f"现价（{close}）比市场平均成本（{avg_cost}）高出两成以上，追高成本偏贵")
+    except Exception:
+        pass
+    try:
+        if lhb_net is not None and float(lhb_net) < 0:
+            risks.append(f"龙虎榜主力净卖出（{lhb_net} 万元），资金在高位出货")
+    except Exception:
+        pass
+    try:
+        if main_5d is not None and float(main_5d) < 0:
+            risks.append(f"近5日主力资金净流出（{main_5d} 亿元），中线大资金在撤退")
+    except Exception:
+        pass
+    try:
+        if margin_chg is not None and float(margin_chg) >= 5:
+            risks.append(f"融资余额猛增（{margin_chg}%），杠杆资金追高、情绪偏过热")
+    except Exception:
+        pass
+    return risks
+
+
 # ============================================================================
 # 模块5：Streamlit 小白友好 UI
 # ============================================================================
@@ -577,12 +749,13 @@ def render_signal_card(row, signal_key, reason):
     name = row.get("name") or ""
     code = row.get("code") or ""
     hold_tag = "（已持仓）" if row.get("is_holding") else "（未持仓）"
+    override_tag = " 👑人类强制收编" if row.get("is_override") else ""
     st.markdown(
         f"""
         <div style="background:{style['color']};color:{style['text']};
                     padding:18px 20px;border-radius:14px;margin-bottom:14px;">
           <div style="font-size:22px;font-weight:800;">
-            {style['emoji']} {name} {code} {hold_tag} —— {signal_key}
+            {style['emoji']} {name} {code} {hold_tag}{override_tag} —— {signal_key}
           </div>
           <div style="font-size:16px;margin-top:8px;line-height:1.6;">{reason}</div>
         </div>
@@ -687,6 +860,7 @@ def main():
                 render_signal_card(row, sig, reason)
                 with st.expander("查看这只股的详细数据"):
                     st.write({
+                        "纳入方式": "👑 人类强制收编（无视AI拒绝）" if row.get("is_override") else "AI 守门员通过",
                         "最新收盘价": fmt(row.get("close")),
                         "10日均价线": fmt(row.get("ma10")),
                         "20日均价线": fmt(row.get("ma20")),
@@ -694,7 +868,13 @@ def main():
                         "净利润同比增长(口径:净利润，代理EPS)": fmt(row.get("npr_growth"), "%"),
                         "当前PE": fmt(row.get("pe")),
                         "PE近3年分位": fmt(row.get("pe_percentile"), "%"),
+                        "市场平均成本": fmt(row.get("avg_cost")),
+                        "收盘获利比例": fmt(row.get("profit_ratio"), "%"),
+                        "龙虎榜净买入(万元)": fmt(row.get("lhb_net")),
                         "近一交易日是否上龙虎榜": "是" if row.get("lhb_flag") else "否",
+                        "今日主力净流入(亿元)": fmt(row.get("main_net_today")),
+                        "近5日主力净流入(亿元)": fmt(row.get("main_net_5d")),
+                        "融资余额变化(%)": fmt(row.get("margin_chg"), "%"),
                         "筹码-低位单峰密集": _chip_text(row, "chip_single_peak"),
                         "筹码-站上平均成本线": _chip_text(row, "chip_above_avg"),
                         "筹码-高位发散": _chip_text(row, "chip_high_diverge"),
@@ -702,40 +882,91 @@ def main():
                     if row.get("analysis"):
                         st.markdown(f"**AI 选股理由：** {row.get('analysis')}")
 
-    # ===== Tab2：加自选股（守门员） =====
+    # ===== Tab2：加自选股（多轮对话投研 Agent） =====
     with tab_add:
-        st.subheader("🛡️ 加自选股 —— AI 帮你把关")
-        st.caption("输入股票代码或名称，AI 会判断它是不是『产业链最底层、别人离不开』的好公司。是，才会加入你的池子。")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            user_input = st.text_input("股票代码 / 简称", placeholder="例如：北方华创 或 002371")
-        with col2:
-            st.write("")
-            st.write("")
-            do_judge = st.button("🔍 让 AI 研判", use_container_width=True)
+        st.subheader("🛡️ 加自选股 —— 和 AI 投研伙伴聊出来")
+        st.caption("直接打一个公司名（如『双环传动』）。AI 不会拿总盘子一刀切地拒绝你，"
+                   "而是帮你拆解它的业务线、撇开红海主业、挖出可能符合紫苏叶的『隐藏核心业务』和你商量。"
+                   "你说『同意』，它就把这只股按这个逻辑入池。")
 
-        # 已入池股票的"重新研判"区
-        if do_judge and user_input.strip():
-            with st.spinner("AI 正在深度研判中…"):
-                ok, data, err = call_deepseek_gatekeeper(deepseek_key, deepseek_model, user_input.strip())
-            if not ok:
-                st.error(err)
-            else:
-                is_perilla = bool(data.get("is_perilla_leaf"))
-                name = data.get("name") or user_input.strip()
-                analysis = data.get("analysis") or ""
-                code = _extract_code(user_input) or _extract_code(name) or user_input.strip()
-                if is_perilla:
-                    upsert_stock(code, name, True, analysis)
-                    st.success(f"✅ 通过！『{name}』符合紫苏叶标准，已加入股票池。")
-                    st.markdown(f"**AI 理由：** {analysis}")
-                    st.info("下一步：点左侧『🔄 一键刷新全池数据』拉取行情，再到『🖼️ 上传筹码图』补充筹码分析。")
+        # 顶部工具条：清空对话
+        tc1, tc2 = st.columns([1, 1])
+        with tc1:
+            if st.button("🧹 清空对话，换一只股", use_container_width=True):
+                st.session_state["m1_chat"] = []
+                st.rerun()
+
+        # 会话历史（既用于界面展示，也作为发给 DeepSeek 的上下文）
+        if "m1_chat" not in st.session_state:
+            st.session_state["m1_chat"] = []
+
+        # 渲染历史对话
+        for msg in st.session_state["m1_chat"]:
+            avatar = "🧑‍💼" if msg["role"] == "user" else "🤖"
+            with st.chat_message(msg["role"], avatar=avatar):
+                st.markdown(msg["content"])
+
+        if not st.session_state["m1_chat"]:
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown("你好！想研究哪只股？直接打公司名或代码（如 **双环传动** 或 **002472**），"
+                            "我先帮你把业务线拆开看看，找找有没有藏着的『紫苏叶锚点』。")
+
+        # 聊天输入
+        prompt = st.chat_input("输入公司名/代码，或回复我（如『同意』『这个逻辑不硬，看看别的赛道』）…")
+        if prompt and prompt.strip():
+            st.session_state["m1_chat"].append({"role": "user", "content": prompt.strip()})
+            with st.chat_message("user", avatar="🧑‍💼"):
+                st.markdown(prompt.strip())
+
+            with st.chat_message("assistant", avatar="🤖"):
+                with st.spinner("AI 正在拆解业务线、寻找紫苏叶锚点…"):
+                    ok, data, err = call_deepseek_agent(
+                        deepseek_key, deepseek_model, st.session_state["m1_chat"]
+                    )
+                if not ok:
+                    st.error(err)
+                    # 失败的这轮用户消息保留，AI 回复不入历史，便于直接重发
                 else:
-                    st.warning(f"❌ 未通过：『{name}』不符合紫苏叶标准，不加入池子。")
-                    st.markdown(f"**AI 理由：** {analysis}")
-        elif do_judge:
-            st.warning("请先输入股票代码或简称。")
+                    reply = data.get("reply") or "（AI 没有给出内容）"
+                    st.markdown(reply)
+                    st.session_state["m1_chat"].append({"role": "assistant", "content": reply})
 
+                    # 动态入库：仅当 AI 判定用户已同意（ready_to_add）才写库
+                    if data.get("ready_to_add"):
+                        name = data.get("name") or ""
+                        code = data.get("code") or _extract_code(name) or ""
+                        anchor = data.get("anchor") or ""
+                        analysis = data.get("analysis") or ""
+                        if not code:
+                            st.warning("我已记下结论，但没能确定股票代码。请直接补一句代码（如 002472），我就入库。")
+                        else:
+                            full_analysis = (f"【紫苏叶锚点：{anchor}】{analysis}"
+                                             if anchor else analysis)
+                            upsert_stock(code, name or code, True, full_analysis)
+                            st.success(f"✅ 已按『{anchor or '该逻辑'}』把 {name}({code}) 入池！"
+                                       "下一步：左侧『🔄 一键刷新全池数据』拉行情，再到『🖼️ 上传筹码图』补筹码。")
+
+        # ===== 👑 强制收编（上帝模式）：AI 实在不认时的兜底 =====
+        st.divider()
+        with st.expander("👑 强制收编（上帝模式）—— AI 死活不认时，手动强行入池"):
+            st.caption("如果聊下来 AI 始终不认它是紫苏叶，但你坚持自己的判断，可在此强行纳入。"
+                       "强制纳入的股会照常参与行情刷新、筹码分析和买卖建议，并打上『👑 人类强制收编』标签。")
+            fc1, fc2 = st.columns([1, 1])
+            with fc1:
+                f_code = st.text_input("股票代码（6位）", key="force_code", placeholder="如 002472")
+            with fc2:
+                f_name = st.text_input("股票简称", key="force_name", placeholder="如 双环传动")
+            if st.button("👑 强制收编 (Override)", type="primary"):
+                code = _extract_code(f_code) or f_code.strip()
+                if not code:
+                    st.warning("请先填写股票代码。")
+                else:
+                    force_add_stock(code, f_name.strip() or code,
+                                    "用户在对话中坚持纳入，未经AI认可。")
+                    st.success(f"👑 已强制收编 {f_name.strip() or code}({code}) 入池！"
+                               "请到左侧『🔄 一键刷新全池数据』拉取行情。")
+
+        # ===== 对已入池股票重新研判 =====
         st.divider()
         st.markdown("##### 🔄 对已入池股票重新研判")
         df_re = load_pool_df()
@@ -778,22 +1009,55 @@ def main():
                     if not ok:
                         st.error(err)
                     else:
-                        update_fields(sel, {
+                        # 筹码结论
+                        save = {
                             "chip_single_peak": 1 if data.get("is_single_peak_low") else 0,
                             "chip_above_avg": 1 if data.get("above_avg_cost") else 0,
                             "chip_high_diverge": 1 if data.get("is_high_diverge") else 0,
                             "chip_confidence": float(data.get("confidence") or 0),
                             "chip_manual": 0,
                             "has_chip": 1,
-                        })
+                        }
+                        # 从图中读到的行情/估值/资金（作为 akshare 失败时的备用来源）：只在读到数字时才写入
+                        img_data = {
+                            "close": _to_float_pct(data.get("close_price")),
+                            "ma10": _to_float_pct(data.get("ma10")),
+                            "ma20": _to_float_pct(data.get("ma20")),
+                            "ma30": _to_float_pct(data.get("ma30")),
+                            "pe": _to_float_pct(data.get("pe")),
+                            "avg_cost": _to_float_pct(data.get("avg_cost")),
+                            "profit_ratio": _to_float_pct(data.get("profit_ratio")),
+                            "lhb_net": _to_float_pct(data.get("lhb_net_wan")),
+                            "main_net_today": _to_float_pct(data.get("main_net_today_yi")),
+                            "main_net_5d": _to_float_pct(data.get("main_net_5d_yi")),
+                            "margin_chg": _to_float_pct(data.get("margin_change_pct")),
+                        }
+                        for k, v in img_data.items():
+                            if v is not None:
+                                save[k] = v
+                        # 图里读到龙虎榜净额，说明它上了龙虎榜
+                        if img_data["lhb_net"] is not None:
+                            save["lhb_flag"] = 1
+                        update_fields(sel, save)
                         st.success("分析完成，结果已保存！")
                         st.markdown(f"**大白话解读：** {data.get('explain', '')}")
                         st.write({
                             "低位单峰密集": "是" if data.get("is_single_peak_low") else "否",
                             "站上平均成本线": "是" if data.get("above_avg_cost") else "否",
                             "高位发散": "是" if data.get("is_high_diverge") else "否",
+                            "图中现价": img_data["close"] if img_data["close"] is not None else "未读到",
+                            "图中MA20 / MA30": f"{img_data['ma20']} / {img_data['ma30']}",
+                            "图中PE": img_data["pe"] if img_data["pe"] is not None else "未读到",
+                            "图中平均成本": img_data["avg_cost"] if img_data["avg_cost"] is not None else "未读到",
+                            "图中获利比例%": img_data["profit_ratio"] if img_data["profit_ratio"] is not None else "未读到",
+                            "图中龙虎榜净买入(万)": img_data["lhb_net"] if img_data["lhb_net"] is not None else "未读到",
+                            "图中今日主力净流入(亿)": img_data["main_net_today"] if img_data["main_net_today"] is not None else "未读到",
+                            "图中近5日主力净流入(亿)": img_data["main_net_5d"] if img_data["main_net_5d"] is not None else "未读到",
+                            "图中融资余额变化%": img_data["margin_chg"] if img_data["margin_chg"] is not None else "未读到",
                             "置信度": f"{round(float(data.get('confidence') or 0)*100)}%",
                         })
+                        if img_data["close"] is None or img_data["ma30"] is None:
+                            st.info("提示：这张图里没读全『现价/均线』数字。如果你的图上有这些数字，请换一张更清晰、能看到现价和均线数值的截图，系统就能直接给出买卖建议。")
 
             # 人工修正区（人工值优先于模型值）
             st.divider()
@@ -834,16 +1098,22 @@ def main():
             show["建议原因"] = reasons
             rename = {
                 "code": "代码", "name": "名称", "is_holding": "已持仓",
+                "is_override": "👑强制收编",
                 "npr_growth": "净利润同比增长%", "pe": "PE", "pe_percentile": "PE近3年分位%",
                 "close": "收盘价", "ma10": "MA10(10日均价)", "ma20": "MA20(20日均价)",
-                "ma30": "MA30(30日均价)", "lhb_flag": "上龙虎榜",
+                "ma30": "MA30(30日均价)", "lhb_flag": "上龙虎榜", "lhb_net": "龙虎榜净买入(万)",
+                "avg_cost": "平均成本", "profit_ratio": "获利比例%",
+                "main_net_today": "今日主力净流入(亿)", "main_net_5d": "近5日主力净流入(亿)",
+                "margin_chg": "融资余额变化%",
                 "chip_single_peak": "低位单峰密集", "chip_above_avg": "站上成本线",
                 "chip_high_diverge": "高位发散", "chip_confidence": "视觉置信度",
                 "has_chip": "已有筹码分析", "updated_at": "更新时间",
             }
-            cols = ["code", "name", "操作建议", "建议原因", "is_holding", "close",
+            cols = ["code", "name", "操作建议", "建议原因", "is_override", "is_holding", "close",
                     "ma10", "ma20", "ma30", "npr_growth", "pe", "pe_percentile",
-                    "lhb_flag", "chip_single_peak", "chip_above_avg", "chip_high_diverge",
+                    "avg_cost", "profit_ratio", "lhb_flag", "lhb_net",
+                    "main_net_today", "main_net_5d", "margin_chg",
+                    "chip_single_peak", "chip_above_avg", "chip_high_diverge",
                     "chip_confidence", "has_chip", "updated_at"]
             cols = [c for c in cols if c in show.columns or c in ("操作建议", "建议原因")]
             show = show[cols].rename(columns=rename)
