@@ -1002,8 +1002,9 @@ def main():
             )
             up = st.file_uploader("上传筹码分布图（png/jpg）", type=["png", "jpg", "jpeg"])
             if up is not None:
-                st.image(up, caption="你上传的筹码图", use_container_width=True)
-                if st.button("🤖 让 AI 分析这张图"):
+                # 分析按钮紧挨上传框，放在图片预览上方，省得上传后还要往下滚很久
+                do_analyze = st.button("🤖 让 AI 分析这张图")
+                if do_analyze:
                     with st.spinner("视觉模型分析中…"):
                         ok, data, err = call_gemini_chip(gemini_key, gemini_model, up.getvalue())
                     if not ok:
@@ -1059,6 +1060,9 @@ def main():
                         if img_data["close"] is None or img_data["ma30"] is None:
                             st.info("提示：这张图里没读全『现价/均线』数字。如果你的图上有这些数字，请换一张更清晰、能看到现价和均线数值的截图，系统就能直接给出买卖建议。")
 
+                # 图片预览放在按钮/结果下方，作为参考
+                st.image(up, caption="你上传的筹码图", use_container_width=True)
+
             # 人工修正区（人工值优先于模型值）
             st.divider()
             st.markdown("##### ✍️ 人工修正（若你觉得 AI 看错了，可在此手动调整）")
@@ -1096,6 +1100,15 @@ def main():
                 reasons.append(why)
             show["操作建议"] = sigs
             show["建议原因"] = reasons
+
+            # 把 0/1 这类布尔列转成"是/否"，更直观
+            def _yn(v):
+                return "是" if (v in (1, "1", True) or v == 1) else "否"
+            for bcol in ["is_holding", "is_override", "lhb_flag",
+                         "chip_single_peak", "chip_above_avg", "chip_high_diverge", "has_chip"]:
+                if bcol in show.columns:
+                    show[bcol] = show[bcol].apply(_yn)
+
             rename = {
                 "code": "代码", "name": "名称", "is_holding": "已持仓",
                 "is_override": "👑强制收编",
@@ -1117,7 +1130,58 @@ def main():
                     "chip_confidence", "has_chip", "updated_at"]
             cols = [c for c in cols if c in show.columns or c in ("操作建议", "建议原因")]
             show = show[cols].rename(columns=rename)
-            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            # 列宽配置：把会被截断的长文字列设宽，并允许悬停看全
+            col_config = {
+                "建议原因": st.column_config.TextColumn("建议原因", width="large"),
+                "操作建议": st.column_config.TextColumn("操作建议", width="medium"),
+                "名称": st.column_config.TextColumn("名称", width="small"),
+            }
+            # 高度自适应：把所有股票一次展示完，不要内部滚动条藏行
+            table_h = min(680, 80 + 38 * max(1, len(show)))
+            st.dataframe(
+                show,
+                use_container_width=True,
+                hide_index=True,
+                height=table_h,
+                column_config=col_config,
+            )
+            st.caption("💡 表格里被截断的文字，把鼠标放上去会显示全文；也可以左右拖动表格、"
+                       "或点右上角放大按钮全屏看。想看完整段落，请展开下方『完整文字视图』。")
+
+            # 下载完整数据（含所有文字）为 CSV
+            st.download_button(
+                "⬇️ 导出完整数据表（CSV）",
+                data=show.to_csv(index=False).encode("utf-8-sig"),
+                file_name="股票池详细数据.csv",
+                mime="text/csv",
+            )
+
+            # 完整文字视图：逐只股纵向展示，文字/数据一个都不截断
+            with st.expander("📖 完整文字视图（每只股的全部文字与数据，绝不截断）", expanded=False):
+                for _, r in df.iterrows():
+                    sig, why = decide(dict(r), npr_threshold, pe_pct_threshold)
+                    emoji = SIGNAL_STYLE.get(sig, {}).get("emoji", "")
+                    ov = " 👑人类强制收编" if r.get("is_override") in (1, "1", True) else ""
+                    st.markdown(f"#### {r.get('name','')}（{r.get('code','')}）{ov}")
+                    st.markdown(f"**操作建议：** {emoji} {sig}")
+                    st.markdown(f"**建议原因：** {why}")
+                    if r.get("analysis"):
+                        st.markdown(f"**AI 选股理由 / 紫苏叶锚点：** {r.get('analysis')}")
+                    st.markdown(
+                        f"- 收盘价 {fmt(r.get('close'))}｜MA10 {fmt(r.get('ma10'))}｜"
+                        f"MA20 {fmt(r.get('ma20'))}｜MA30 {fmt(r.get('ma30'))}\n"
+                        f"- 净利润同比增长 {fmt(r.get('npr_growth'),'%')}｜PE {fmt(r.get('pe'))}｜"
+                        f"PE近3年分位 {fmt(r.get('pe_percentile'),'%')}\n"
+                        f"- 平均成本 {fmt(r.get('avg_cost'))}｜获利比例 {fmt(r.get('profit_ratio'),'%')}｜"
+                        f"龙虎榜净买入 {fmt(r.get('lhb_net'))}万\n"
+                        f"- 今日主力净流入 {fmt(r.get('main_net_today'))}亿｜"
+                        f"近5日主力净流入 {fmt(r.get('main_net_5d'))}亿｜"
+                        f"融资余额变化 {fmt(r.get('margin_chg'),'%')}\n"
+                        f"- 更新时间：{r.get('updated_at') or '—'}"
+                    )
+                    st.divider()
+
             st.caption("名词解释：MA = 均价线（最近N天平均成本）；PE = 市盈率（越低越便宜）；"
                        "PE近3年分位 = 当前估值在近3年里的高低位置（越低越便宜）；"
                        "戴维斯双击 = 业绩大涨 + 估值偏低 的双重利好。")
