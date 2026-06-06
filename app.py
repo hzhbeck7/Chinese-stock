@@ -129,7 +129,8 @@ def init_db():
     for col, typ in [("avg_cost", "REAL"), ("profit_ratio", "REAL"), ("lhb_net", "REAL"),
                      ("main_net_today", "REAL"), ("main_net_5d", "REAL"), ("margin_chg", "REAL"),
                      ("is_override", "INTEGER DEFAULT 0"), ("eps", "REAL"),
-                     ("serenity_score", "REAL"), ("score_detail", "TEXT")]:
+                     ("serenity_score", "REAL"), ("score_detail", "TEXT"),
+                     ("gdhs", "REAL"), ("gdhs_chg", "REAL")]:
         try:
             cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
         except Exception:
@@ -295,6 +296,15 @@ SERENITY_SCORE_GUIDE = """【请给 8 个维度各打 0~5 分（整数）】含�
 【再给 4 项风险各打 0~5 分（整数，越高越糟，会扣分）】：增发摊薄、公司治理、炒作过热、财务质量。
 打分原则：没把握就给 2~3 分，不要动不动给满分。"""
 
+# 伪概念/假紫苏叶排除清单（注入各研判提示词，命中越多越要往否决/降分靠）
+SERENITY_ANTIPATTERNS = """【伪概念排除 6 条——命中任一条都要警惕，命中越多越不像真紫苏叶，请在理由里点名是哪几条】：
+①蹭热点贴标签：相关业务不是主营、占营收很小，只是为了蹭概念在互动平台/公告里贴标签；
+②竞争分散没护城河：国内同行一大把、谁都能做，价格战激烈，没有真正壁垒；
+③扩产太容易：产能想扩就扩、设备随便买、新玩家一两年就能进来，卡不住别人；
+④"国产替代"伪命题：其实早已大面积国产化、或这环节根本不卡脖子，替代故事是讲给散户听的；
+⑤利好已被充分定价：逻辑全市场都知道、股价已经炒高，估值透支了未来好几年的预期；
+⑥无机构覆盖/流动性差：几乎没有券商研报覆盖、日成交额常年低于5000万，容易被操纵、买卖难成交。"""
+
 PERILLA_SYSTEM_PROMPT = """你是一位顶级的A股硬科技产业链研究专家，精通"紫苏叶理论"。
 "紫苏叶公司"的严格标准（必须同时满足）：
 1. 处于产业链的深层节点（Layer3 及以下，即底层硬件、核心材料、关键设备等"卖水人"角色），而非终端品牌或应用层。
@@ -305,9 +315,11 @@ PERILLA_SYSTEM_PROMPT = """你是一位顶级的A股硬科技产业链研究专�
 
 """ + SERENITY_SCORE_GUIDE + """
 
-请基于你的知识，判断用户给出的公司是否符合"紫苏叶公司"标准。
+""" + SERENITY_ANTIPATTERNS + """
+
+请基于你的知识，判断用户给出的公司是否符合"紫苏叶公司"标准。命中伪概念排除条目越多，越应下调 is_perilla_leaf 与评分。
 你必须只返回一个 JSON 对象，不要任何额外文字、不要markdown代码块标记，格式严格如下：
-{"is_perilla_leaf": true 或 false, "name": "公司中文简称", "chain_layer": "锚点业务卡在第几层（如：第4层 芯片/器件）", "analysis": "用通俗易懂的大白话解释判断理由，并点明卡在第几层、命中了哪几条卡脖子特征，150字以内，让股票小白也能看懂", "factors": {"需求拐点":0-5, "架构耦合":0-5, "卡脖子严重度":0-5, "供应商集中度":0-5, "扩产难度":0-5, "证据质量":0-5, "估值偏离":0-5, "催化时机":0-5}, "penalties": {"增发摊薄":0-5, "公司治理":0-5, "炒作过热":0-5, "财务质量":0-5}}
+{"is_perilla_leaf": true 或 false, "name": "公司中文简称", "chain_layer": "锚点业务卡在第几层（如：第4层 芯片/器件）", "antipattern_hits": "命中的伪概念排除条目（如：①蹭热点、⑤已被定价；没有则填 无）", "analysis": "用通俗易懂的大白话解释判断理由，点明卡在第几层、命中了哪几条卡脖子特征，若命中伪概念也要说清，150字以内，让股票小白也能看懂", "factors": {"需求拐点":0-5, "架构耦合":0-5, "卡脖子严重度":0-5, "供应商集中度":0-5, "扩产难度":0-5, "证据质量":0-5, "估值偏离":0-5, "催化时机":0-5}, "penalties": {"增发摊薄":0-5, "公司治理":0-5, "炒作过热":0-5, "财务质量":0-5}}
 """
 
 
@@ -445,9 +457,21 @@ PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专�
 
 """ + SERENITY_SCORE_GUIDE + """
 
+""" + SERENITY_ANTIPATTERNS + """
+
+【A股卡脖子样例参考】（只是示范"卡在产业链深层的卖水人"是什么范式，帮助你给出准确的细分环节与真实代码；不要只局限于这些，要按当下热度灵活发挥）：
+· 电力/特高压 → 换流变压器、套管等核心设备（如 国电南瑞 600406）
+· 光通信/AI算力 → 上游 EML/DFB 激光器芯片（如 源杰科技 688498）
+· 半导体设备 → 薄膜沉积/刻蚀等关键设备（如 中微公司 688012、北方华创 002371）
+· 军工新材料 → 高温特种合金、碳纤维（如 中简科技 300777、光威复材 300699）
+· 新能源车 → 碳纳米管导电剂（如 天奈科技 688116）、高镍正极（如 当升科技 300073）
+· 创新药 → 自主靶点 + CDMO 产能（如 恒瑞医药 600276、药明康德 603259）
+· 种业 → 转基因种子性状（如 隆平高科 000998、大北农 002385）
+要点：这些都是"别人绕不开、玩家极少、扩产难"的深层环节；挖掘时找类似卡位的细分龙头，别被"AI/机器人/新能源"等大筐迷惑，务必拆到最卡脖子的那一层。
+
 【任务——三步思维链】：
 第一步：识别当前A股市场最核心的 3 到 5 个硬科技热门赛道（要多元，不要只盯机器人；可考虑如固态电池、低空经济、商业航天、合成生物、AI算力/光模块、半导体设备/材料、可控核聚变等当下真实热门方向）。
-第二步：在每个赛道里，用紫苏叶理论深度挖掘那条"别人离不开、卡脖子、玩家极少"的底层环节。
+第二步：在每个赛道里，用紫苏叶理论深度挖掘那条"别人离不开、卡脖子、玩家极少"的底层环节；并用伪概念排除 6 条自查、剔除蹭热点的假票。
 第三步：每个赛道推荐 1-2 只最符合紫苏叶标准的 A 股上市公司（须是真实存在的A股，给出准确的6位代码）。
 
 【输出格式——必须严格遵守】：
@@ -466,6 +490,7 @@ PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专�
          "competitors": "全球或国内的有效竞争对手大致有哪几家（体现玩家极少）",
          "reason": "用大白话总结为什么它符合紫苏叶标准，100字内，让股票小白也能看懂",
          "thesis_breaker": "⚠️这套逻辑的死穴：什么情况一旦发生，就说明看错了/该回避（如：被某新技术替代、对手扩产、客户自研），大白话，60字内",
+         "antipattern_hits": "命中的伪概念排除条目（如：①蹭热点、③扩产太容易；没有则填 无）",
          "confidence": "证据可信度，只能填三选一：已确认 / 推断 / 待核实（'已确认'=公认事实；'推断'=你的合理推断；'待核实'=不太确定）",
          "factors": {"需求拐点":0-5, "架构耦合":0-5, "卡脖子严重度":0-5, "供应商集中度":0-5, "扩产难度":0-5, "证据质量":0-5, "估值偏离":0-5, "催化时机":0-5},
          "penalties": {"增发摊薄":0-5, "公司治理":0-5, "炒作过热":0-5, "财务质量":0-5}
@@ -786,6 +811,167 @@ def fetch_lhb_flag(code):
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_chip_cyq(code):
+    """
+    【自动筹码】用东方财富『筹码分布』接口 stock_cyq_em 自动获取筹码数据，
+    免去每次都要手动上传筹码图。返回 dict；抓不到返回 None。
+
+    返回字段：
+      chip_single_peak / chip_above_avg / chip_high_diverge（三个布尔，1/0）
+      profit_ratio（收盘获利比例%）、avg_cost（市场平均成本）、chip_confidence（≈0.6）
+
+    重要说明：
+      1) 这三个布尔是【程序启发式估算】，没有"看图"那么精准，仅作默认值；
+         你仍可到『上传筹码图』页面用视觉模型/人工修正得到更准的结论（会优先生效）。
+      2) 东财筹码服务器对部分网络/云服务器 IP 可能拒绝连接；失败时本函数返回 None，
+         上层会保留原值并回退到"上传筹码图"老路，不影响股价/财务等其他数据。
+    """
+    ak = _get_akshare()
+    if ak is None:
+        return None
+    c = str(code).zfill(6)
+    try:
+        df = ak.stock_cyq_em(symbol=c, adjust="qfq")
+    except Exception:
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    try:
+        date_col = "日期" if "日期" in df.columns else df.columns[0]
+        try:
+            df = df.sort_values(date_col)
+        except Exception:
+            pass
+        last = df.iloc[-1]
+
+        def _g(*names):
+            for n in names:
+                if n in df.columns:
+                    try:
+                        fv = float(last.get(n))
+                        if fv == fv:  # 排除 NaN
+                            return fv
+                    except Exception:
+                        continue
+            return None
+
+        profit = _g("获利比例")          # 0~1，越大说明越多筹码处于盈利
+        avg_cost = _g("平均成本")
+        conc90 = _g("90集中度")          # 越小=筹码越集中（单峰）；越大=越分散
+        # 关键字段都没有就放弃
+        if profit is None and avg_cost is None and conc90 is None:
+            return None
+
+        # —— 启发式派生三布尔 ——
+        # 低位单峰密集：筹码很集中(90集中度小) 且 价格不在高位(获利盘不算太多)
+        single_peak = bool(
+            conc90 is not None and conc90 <= 0.15
+            and (profit is None or profit <= 0.60)
+        )
+        # 站上平均成本线：超过半数筹码处于盈利 ≈ 现价在平均成本之上
+        above_avg = bool(profit is not None and profit >= 0.50)
+        # 高位发散：几乎全员获利 且 筹码偏分散
+        high_diverge = bool(
+            profit is not None and profit >= 0.90
+            and (conc90 is None or conc90 >= 0.20)
+        )
+
+        return {
+            "chip_single_peak": 1 if single_peak else 0,
+            "chip_above_avg": 1 if above_avg else 0,
+            "chip_high_diverge": 1 if high_diverge else 0,
+            "profit_ratio": round(profit * 100, 2) if profit is not None else None,
+            "avg_cost": round(avg_cost, 2) if avg_cost is not None else None,
+            "chip_confidence": 0.6,
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_gdhs(code):
+    """
+    【股东户数】东方财富 stock_zh_a_gdhs_detail_em（按个股，返回历年股东户数明细）。
+    返回 (最新股东户数, 较上期变化%)；失败返回 (None, None)。
+    口径：户数变化为负（减少）= 筹码在集中 = 利好；为正（增加）= 筹码在分散 = 偏空。
+    （注意：不要用 stock_zh_a_gdhs，那个是按季度日期取全市场、会遍历上千只、极慢。）
+    """
+    ak = _get_akshare()
+    if ak is None:
+        return None, None
+    c = str(code).zfill(6)
+    try:
+        df = ak.stock_zh_a_gdhs_detail_em(symbol=c)
+    except Exception:
+        return None, None
+    if df is None or getattr(df, "empty", True):
+        return None, None
+
+    def _num(v):
+        try:
+            fv = float(str(v).replace(",", "").replace("%", "").strip())
+            return fv if fv == fv else None
+        except Exception:
+            return None
+
+    try:
+        # 按截止日排序，取最新一行
+        date_col = None
+        for cand in ("股东户数统计截止日", "截止日", "股东户数公告日期", "报告期"):
+            if cand in df.columns:
+                date_col = cand
+                break
+        if date_col:
+            try:
+                df = df.sort_values(date_col)
+            except Exception:
+                pass
+        last = df.iloc[-1]
+
+        latest = None
+        for cand in ("股东户数-本次", "股东户数", "期末股东户数"):
+            if cand in df.columns:
+                latest = _num(last.get(cand))
+                if latest is not None:
+                    break
+
+        chg = None
+        # 优先用现成的"增减比例"列
+        for cand in ("股东户数-增减比例", "增减比例"):
+            if cand in df.columns:
+                chg = _num(last.get(cand))
+                if chg is not None:
+                    break
+        # 没有现成比例则用 本次/上次 计算
+        if chg is None:
+            prev = None
+            for cand in ("股东户数-上次", "上次股东户数"):
+                if cand in df.columns:
+                    prev = _num(last.get(cand))
+                    if prev is not None:
+                        break
+            if prev is None:
+                # 退而求其次：用倒数第二行的户数
+                vals = []
+                for cand in ("股东户数-本次", "股东户数", "期末股东户数"):
+                    if cand in df.columns:
+                        vals = [_num(x) for x in df[cand].tolist()]
+                        vals = [x for x in vals if x is not None]
+                        break
+                if len(vals) >= 2:
+                    prev = vals[-2]
+                    latest = latest if latest is not None else vals[-1]
+            if prev and latest is not None and prev != 0:
+                chg = round((latest - prev) / prev * 100, 2)
+
+        if latest is None:
+            return None, None
+        return latest, chg
+    except Exception:
+        return None, None
+
+
 def _to_float_pct(v):
     """把可能带 % 或文字的值转成 float；不可转返回 None。"""
     if v is None:
@@ -834,6 +1020,35 @@ def refresh_one_stock(code):
     lhb = fetch_lhb_flag(code)
     if lhb is not None:
         fields["lhb_flag"] = 1 if lhb else 0
+
+    # 股东户数（户数减少=筹码集中=利好；取不到则不动原值）
+    gdhs, gdhs_chg = fetch_gdhs(code)
+    if gdhs is not None:
+        fields["gdhs"] = gdhs
+    if gdhs_chg is not None:
+        fields["gdhs_chg"] = gdhs_chg
+
+    # 自动筹码（免上传图）：仅当该股【没有被人工修正过】时，才用自动估算覆盖筹码字段。
+    # 人工/视觉看图的结论更准，必须优先保留（chip_manual=1 时跳过自动覆盖）。
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT chip_manual FROM stock_pool WHERE code=?", (code,))
+        _r = cur.fetchone()
+        conn.close()
+        manual = bool(_r["chip_manual"]) if _r is not None else False
+    except Exception:
+        manual = False
+    if not manual:
+        chip = fetch_chip_cyq(code)
+        if chip:
+            for k in ("chip_single_peak", "chip_above_avg", "chip_high_diverge",
+                      "profit_ratio", "avg_cost", "chip_confidence"):
+                v = chip.get(k)
+                if v is not None:
+                    fields[k] = v
+            # 自动拿到筹码 → 标记 has_chip=1，这样无需上传图也能出完整买卖建议
+            fields["has_chip"] = 1
 
     if fields:
         update_fields(code, fields)
@@ -943,8 +1158,11 @@ DUAL_SELECT_PROMPT = """你是A股硬科技产业链专家，精通『紫苏叶�
 """ + SERENITY_FRAMEWORK + """
 
 """ + SERENITY_SCORE_GUIDE + """
+
+""" + SERENITY_ANTIPATTERNS + """
+命中伪概念排除条目越多，越要下调 is_perilla 与评分。
 只返回一个JSON对象（不要任何多余文字、不要markdown标记）：
-{"is_perilla": true或false, "anchor": "紫苏叶锚点业务名或null", "chain_layer": "卡在第几层（如：第4层 芯片/器件）", "reason": "大白话理由，点明卡在第几层、命中哪几条卡脖子特征，120字以内，让股票小白看懂", "factors": {"需求拐点":0-5,"架构耦合":0-5,"卡脖子严重度":0-5,"供应商集中度":0-5,"扩产难度":0-5,"证据质量":0-5,"估值偏离":0-5,"催化时机":0-5}, "penalties": {"增发摊薄":0-5,"公司治理":0-5,"炒作过热":0-5,"财务质量":0-5}}"""
+{"is_perilla": true或false, "anchor": "紫苏叶锚点业务名或null", "chain_layer": "卡在第几层（如：第4层 芯片/器件）", "antipattern_hits": "命中的伪概念排除条目（没有则填 无）", "reason": "大白话理由，点明卡在第几层、命中哪几条卡脖子特征，若命中伪概念也要说清，120字以内，让股票小白看懂", "factors": {"需求拐点":0-5,"架构耦合":0-5,"卡脖子严重度":0-5,"供应商集中度":0-5,"扩产难度":0-5,"证据质量":0-5,"估值偏离":0-5,"催化时机":0-5}, "penalties": {"增发摊薄":0-5,"公司治理":0-5,"炒作过热":0-5,"财务质量":0-5}}"""
 
 DUAL_DECISION_PROMPT = """你是一位严格遵循『紫苏叶选股 + 戴维斯双击 + 右侧交易』的A股投资顾问。
 我会给你一只股票的关键数据，以及系统规则引擎的初步结论。请你独立判断当前应采取的操作。
@@ -1135,6 +1353,48 @@ def serenity_grade(score):
     return "早期/低优先"
 
 
+def buyability_score(close, ma20, ma30):
+    """
+    【今日可买入度】只看"当天股价 vs 均线"判断现在是不是买点（与基本面紫苏叶评分相互独立）。
+    返回 (buy_score:int 0~100 或 None, tag:大白话档位, why:一句话原因)。
+    口径（右侧交易）：站上均线=可买、分高；还在均线下方=左侧寻底、暂别追、分低。
+    """
+    try:
+        c = float(close)
+        m30 = float(ma30)
+    except (TypeError, ValueError):
+        return None, "买点未知", "行情没拉到（股价/均线缺失），先刷新再看。"
+    m20 = None
+    try:
+        m20 = float(ma20)
+    except (TypeError, ValueError):
+        m20 = None
+
+    if m20 is not None and c > m20 and c > m30:
+        return 90, "🟢 现在可买", "已站上20日和30日均价线，处于右侧上涨，可分批建仓。"
+    if c > m30:
+        return 60, "🟡 接近买点", "已站上30日均价线，但还没站上20日线，趋势待确认，可小仓试探或再等等。"
+    return 30, "🔴 暂别追", "还在30日均价线下方，处于左侧寻底，先观望，等它站稳均线再说。"
+
+
+def eval_buyability_for_sectors(sectors):
+    """为挖掘结果里每只股票评估『今日可买入度』（联网取价算分），结果写回 stk['_buy_*']。单只失败不影响其他。"""
+    for sec in sectors or []:
+        for stk in sec.get("stocks", []) or []:
+            code = str(stk.get("code") or "")
+            if not code:
+                stk["_buy_score"], stk["_buy_tag"], stk["_buy_why"] = None, "买点未知", "缺少股票代码"
+                continue
+            try:
+                ma = fetch_price_ma(code)
+                bs, tag, why = buyability_score(ma.get("close"), ma.get("ma20"), ma.get("ma30"))
+                stk["_buy_score"], stk["_buy_tag"], stk["_buy_why"] = bs, tag, why
+                stk["_close"], stk["_ma20"], stk["_ma30"] = ma.get("close"), ma.get("ma20"), ma.get("ma30")
+            except Exception:
+                stk["_buy_score"], stk["_buy_tag"], stk["_buy_why"] = None, "买点未知", "行情没拉到（可重试）"
+    return sectors
+
+
 def _avg_factor_dicts(*dicts):
     """把多个 {维度:分} 字典按维度求平均（用于双AI评分合并）。空输入返回 {}。"""
     valid = [d for d in dicts if isinstance(d, dict) and d]
@@ -1211,9 +1471,9 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
             return "坚决清仓卖出", f"你持有的这只股，股价（{close}）已跌破30日均价线（{ma30}）这条重要生命线，按纪律应坚决离场止损。"
         return "坚决清仓卖出", "你持有的这只股出现筹码『高位发散』，主力可能在高位派发，建议坚决离场。"
 
-    # 2) 视觉必需 gate：没有筹码分析就不出完整买入建议
-    if not has_chip:
-        return "待补充筹码数据", "还没上传这只股的『筹码分布图』。请到『上传筹码图』页面上传后，系统才能给出完整买卖建议。"
+    # 2) 筹码数据缺失：不再"无图就拦死"，而是基于股价/均线照常给建议，仅附一句温馨提示。
+    #    （系统会自动抓取筹码；若自动也没抓到、又没传图，则筹码相关加分/风控项不参与。）
+    chip_hint = "" if has_chip else "（温馨提示：这只股的筹码数据暂时没拿到，下面结论主要看股价和均线；想要更精准的买卖点，可到『上传筹码图』页面补一张图。）"
 
     # 3) 紫苏叶逻辑成立
     if is_perilla:
@@ -1222,12 +1482,12 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
             if is_holding:
                 tip = f"移动止盈提示：跌破10日均价线（{row.get('ma10')}）可考虑减仓，跌破30日均价线（{ma30}）则清仓。"
                 if high_risk:
-                    return "持有移动止盈", "趋势仍在均线之上，可继续持有，但要警惕高位风险：" + "；".join(risks) + "。" + tip
-                return "持有移动止盈", f"股价（{close}）稳稳站在均价线之上，趋势健康，继续持有。{tip}"
+                    return "持有移动止盈", "趋势仍在均线之上，可继续持有，但要警惕高位风险：" + "；".join(risks) + "。" + tip + chip_hint
+                return "持有移动止盈", f"股价（{close}）稳稳站在均价线之上，趋势健康，继续持有。{tip}{chip_hint}"
             else:
                 # 未持仓：高位则不建议追高买入（安全保护）
                 if high_risk:
-                    return "只看不动观望", "是符合紫苏叶标准的好公司，技术上也站上了均线，但【现在是高位，不建议追高买入】：" + "；".join(risks) + "。建议等股价回调到均线附近、获利盘消化后再考虑。"
+                    return "只看不动观望", "是符合紫苏叶标准的好公司，技术上也站上了均线，但【现在是高位，不建议追高买入】：" + "；".join(risks) + "。建议等股价回调到均线附近、获利盘消化后再考虑。" + chip_hint
                 davis = is_davis_double(row, npr_threshold, pe_pct_threshold)
                 # 卡位优先级：紫苏叶评分≥70（卡得很死的上游环节）也作为强烈买入的加分触发
                 sc = row.get("serenity_score")
@@ -1244,12 +1504,12 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
                         why.append("业绩大涨且估值偏低（戴维斯双击）")
                     if strong_score:
                         why.append(f"产业链卡位极硬（紫苏叶评分 {int(float(sc))} 分，{serenity_grade(sc)}）")
-                    return "强烈买入", "符合紫苏叶好公司，且股价站上均线，又叠加" + "、".join(why) + "，是难得的好买点，可分批建仓。"
-                return "分批建仓买入", f"这是符合紫苏叶标准的好公司，股价（{close}）已站上20日和30日均价线，进入右侧上涨，可分批建仓买入。"
+                    return "强烈买入", "符合紫苏叶好公司，且股价站上均线，又叠加" + "、".join(why) + "，是难得的好买点，可分批建仓。" + chip_hint
+                return "分批建仓买入", f"这是符合紫苏叶标准的好公司，股价（{close}）已站上20日和30日均价线，进入右侧上涨，可分批建仓买入。{chip_hint}"
         elif close < ma30:
-            return "只看不动观望", f"好公司，但股价（{close}）还在30日均价线（{ma30}）下方，处于左侧寻底阶段，先观望，等它站稳均线再说。"
+            return "只看不动观望", f"好公司，但股价（{close}）还在30日均价线（{ma30}）下方，处于左侧寻底阶段，先观望，等它站稳均线再说。{chip_hint}"
         else:
-            return "只看不动观望", f"好公司，股价（{close}）在30日均价线之上但还没站上20日线（{ma20}），趋势未完全走强，先观望。"
+            return "只看不动观望", f"好公司，股价（{close}）在30日均价线之上但还没站上20日线（{ma20}），趋势未完全走强，先观望。{chip_hint}"
 
     # 兜底
     return "只看不动观望", "暂不满足明确的买入或卖出条件，保持观望。"
@@ -1289,6 +1549,94 @@ def _high_position_risks(row, close):
     except Exception:
         pass
     return risks
+
+
+def _bull_bear_signals(row):
+    """汇总一只股的『做多理由』与『做空理由』两份大白话清单，供多空对比卡展示。"""
+    bulls, bears = [], []
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma30 = row.get("ma30")
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    c, m20, m30 = _f(close), _f(ma20), _f(ma30)
+
+    # —— 趋势/均线 ——
+    if c is not None and m30 is not None:
+        if m20 is not None and c > m20 and c > m30:
+            bulls.append(f"股价（{close}）站上20日和30日均价线，处于右侧上涨")
+        elif c > m30:
+            bulls.append(f"股价（{close}）站在30日均价线（生命线）之上")
+        if c < m30:
+            bears.append(f"股价（{close}）跌破30日均价线（{ma30}）这条重要生命线")
+        elif m20 is not None and c < m20:
+            bears.append(f"股价（{close}）还没站上20日均价线（{ma20}），趋势偏弱")
+
+    # —— 筹码 ——
+    if row.get("has_chip"):
+        if row.get("chip_single_peak"):
+            bulls.append("筹码低位单峰密集（成本集中、抛压小）")
+        if row.get("chip_above_avg"):
+            bulls.append("股价站上市场平均成本线（多数持有人盈利）")
+        if row.get("chip_high_diverge"):
+            bears.append("筹码高位发散（获利盘大、主力可能在派发）")
+
+    # —— 业绩 + 估值（戴维斯双击，用默认阈值 20% / 50% 粗判）——
+    npr = _f(row.get("npr_growth"))
+    pe_pct = _f(row.get("pe_percentile"))
+    if npr is not None and npr > 20:
+        bulls.append(f"净利润同比大涨（{npr}%），业绩向好")
+    if npr is not None and npr < 0:
+        bears.append(f"净利润同比下滑（{npr}%），业绩承压")
+    if pe_pct is not None and pe_pct < 50:
+        bulls.append(f"估值处于近3年偏低位置（PE分位{pe_pct}%），不算贵")
+    if pe_pct is not None and pe_pct >= 80:
+        bears.append(f"估值处于近3年高位（PE分位{pe_pct}%），偏贵")
+
+    # —— 紫苏叶卡位 ——
+    sc = _f(row.get("serenity_score"))
+    if sc is not None and sc >= 70:
+        bears_note = ""
+        bulls.append(f"产业链卡位极硬（紫苏叶评分 {int(sc)} 分，{serenity_grade(sc)}）{bears_note}")
+
+    # —— 股东户数 ——
+    chg = _f(row.get("gdhs_chg"))
+    if chg is not None:
+        if chg < 0:
+            bulls.append(f"股东户数较上期减少 {abs(chg)}%（筹码在集中，常是利好）")
+        elif chg > 0:
+            bears.append(f"股东户数较上期增加 {chg}%（筹码在分散，需留意）")
+
+    # —— 高位追高风险（复用现成清单）——
+    for r in _high_position_risks(row, close):
+        bears.append(r)
+
+    return bulls, bears
+
+
+def render_bull_bear(row):
+    """在卡片下方渲染『做多理由 vs 做空理由』两列对比（纯展示，不改决策）。"""
+    bulls, bears = _bull_bear_signals(row)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**🟢 做多理由（看涨）**")
+        if bulls:
+            for b in bulls:
+                st.markdown(f"- {b}")
+        else:
+            st.caption("暂无明显看涨信号")
+    with col_b:
+        st.markdown("**🔴 做空理由（看跌/风险）**")
+        if bears:
+            for b in bears:
+                st.markdown(f"- {b}")
+        else:
+            st.caption("暂无明显看跌信号")
 
 
 # ============================================================================
@@ -1579,6 +1927,8 @@ def main():
             # 同一信号档内，紫苏叶评分高（卡位更硬）的票排在前面
             for _, row, sig, reason in sorted(cards, key=lambda x: (x[0], -(x[1].get("serenity_score") or 0))):
                 render_signal_card(row, sig, reason)
+                # 多空信号对比：一眼看清看涨与看跌两面
+                render_bull_bear(row)
                 with st.expander("查看这只股的详细数据"):
                     _sc = row.get("serenity_score")
                     st.write({
@@ -1600,9 +1950,20 @@ def main():
                         "今日主力净流入(亿元)": fmt(row.get("main_net_today")),
                         "近5日主力净流入(亿元)": fmt(row.get("main_net_5d")),
                         "融资余额变化(%)": fmt(row.get("margin_chg"), "%"),
+                        "股东户数": fmt(row.get("gdhs")),
+                        "股东户数较上期变化": (
+                            (f"{row.get('gdhs_chg')}%（"
+                             + ("↓减少，筹码集中、偏利好"
+                                if (row.get('gdhs_chg') is not None and float(row.get('gdhs_chg')) < 0)
+                                else ("↑增加，筹码分散、需留意"
+                                      if (row.get('gdhs_chg') is not None and float(row.get('gdhs_chg')) > 0)
+                                      else "基本持平")) + "）")
+                            if row.get("gdhs_chg") is not None else MISSING),
                         "筹码-低位单峰密集": _chip_text(row, "chip_single_peak"),
                         "筹码-站上平均成本线": _chip_text(row, "chip_above_avg"),
                         "筹码-高位发散": _chip_text(row, "chip_high_diverge"),
+                        "筹码来源": ("自动估算（东财筹码分布，约略）" if (row.get("has_chip") and not row.get("chip_manual"))
+                                     else ("看图/人工修正" if row.get("has_chip") else "暂无")),
                     })
                     if row.get("analysis"):
                         st.markdown(f"**AI 选股理由：** {row.get('analysis')}")
@@ -1858,9 +2219,18 @@ def main():
                 st.session_state.pop("miner_result", None)
                 st.error(err)
             else:
-                st.session_state["miner_result"] = data.get("sectors", [])
+                _secs = data.get("sectors", [])
+                with st.spinner("正在评估各股当前买点（看是否站上均线）…"):
+                    eval_buyability_for_sectors(_secs)
+                st.session_state["miner_result"] = _secs
 
         sectors = st.session_state.get("miner_result")
+        if sectors:
+            if st.button("🔄 重新评估各股当前买点（行情会变）", use_container_width=True):
+                with st.spinner("正在重新评估各股当前买点…"):
+                    eval_buyability_for_sectors(sectors)
+                st.session_state["miner_result"] = sectors
+                st.rerun()
         if sectors is not None:
             if not sectors:
                 st.warning("这次没挖到合适的标的，请再点一次试试。")
@@ -1892,15 +2262,18 @@ def main():
                             scores.append(sc_v)
                         else:
                             stk["_score"] = None
-                    # 赛道内按评分高→低排序（无分排最后）
-                    sec["stocks"] = sorted(stks, key=lambda s: -(s.get("_score") or -1))
+                    # 赛道内排序：先看『今日可买入度』（现在能买的排前），再看紫苏叶评分
+                    sec["stocks"] = sorted(
+                        stks, key=lambda s: (-(s.get("_buy_score") or -1), -(s.get("_score") or -1)))
                     sec["_avg"] = round(sum(scores) / len(scores)) if scores else None
 
                 # 赛道按平均分高→低排序，让最值得看的赛道排最前
                 sectors_sorted = sorted(sectors, key=lambda x: -(x.get("_avg") or -1))
 
-                st.success(f"挖掘完成！AI 扫描出 {len(sectors_sorted)} 个热门赛道，已按『紫苏叶评分』从高到低排好序：")
-                st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局/评分可能有误，收编前请自行核对。评分越高=卡位越硬越值得关注。")
+                st.success(f"挖掘完成！AI 扫描出 {len(sectors_sorted)} 个热门赛道，赛道按紫苏叶均分排序；"
+                           "每个赛道内已把『现在就能买（站上均线）』的票排在前面。")
+                st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局/评分可能有误，收编前请自行核对。"
+                           "🌿紫苏叶评分=公司卡位有多硬（基本面）；可买入度=按当天股价判断现在是不是买点（两者分开看）。")
                 for si, sec in enumerate(sectors_sorted):
                     sname = sec.get("sector", "未知赛道")
                     avg = sec.get("_avg")
@@ -1916,20 +2289,33 @@ def main():
                                           f"padding:1px 8px;font-size:14px;margin-left:8px;'>🌿 {sc_v}/100 · {serenity_grade(sc_v)}</span>"
                                           if sc_v is not None else
                                           "<span style='background:#bbb;color:#fff;border-radius:8px;padding:1px 8px;font-size:13px;margin-left:8px;'>未评分</span>")
+                            # 今日可买入度徽章（按当天股价 vs 均线）
+                            bs_v = stk.get("_buy_score")
+                            buy_tag = stk.get("_buy_tag") or "买点未知"
+                            buy_bg = {"🟢 现在可买": "#1a7f37", "🟡 接近买点": "#9a6700",
+                                      "🔴 暂别追": "#b00020"}.get(buy_tag, "#777")
+                            buy_html = (f"<span style='background:{buy_bg};color:#fff;border-radius:8px;"
+                                        f"padding:1px 8px;font-size:14px;margin-left:8px;'>{buy_tag}"
+                                        f"{(' ' + str(bs_v) + '/100') if bs_v is not None else ''}</span>")
                             layer = stk.get("chain_layer") or "—"
                             breaker = stk.get("thesis_breaker") or "—"
                             conf = _conf_badge(stk.get("confidence"))
+                            buy_why = stk.get("_buy_why") or ""
+                            anti = (stk.get("antipattern_hits") or "").strip()
+                            anti_html = ("" if (not anti or anti in ("无", "None", "—"))
+                                         else f"<br><span style='color:#9a6700;'><b>⚠️ 伪概念命中：</b>{anti}</span>")
                             st.markdown(
                                 f"<div style='background:#f6f9ff;border:1px solid #d6e4ff;"
                                 f"border-radius:10px;padding:12px 14px;margin:8px 0;'>"
                                 f"<div style='font-size:17px;font-weight:800;color:#1a3c8c;'>"
-                                f"📌 {name}（{code}）{score_html}</div>"
+                                f"📌 {name}（{code}）{score_html}{buy_html}</div>"
                                 f"<div style='margin-top:6px;line-height:1.6;'>"
+                                f"<b>今日买点：</b>{buy_why}<br>"
                                 f"<b>产业链卡位：</b>{layer}<br>"
                                 f"<b>卡脖子/底层节点：</b>{stk.get('bottleneck','—')}<br>"
                                 f"<b>主要竞争对手：</b>{stk.get('competitors','—')}<br>"
                                 f"<b>紫苏叶理由：</b>{stk.get('reason','—')}<br>"
-                                f"<b>证据可信度：</b>{conf}<br>"
+                                f"<b>证据可信度：</b>{conf}{anti_html}<br>"
                                 f"<span style='color:#b00020;'><b>⚠️ 这套逻辑的死穴：</b>{breaker}</span>"
                                 f"</div></div>",
                                 unsafe_allow_html=True,
@@ -1998,7 +2384,8 @@ def main():
                             "chip_above_avg": 1 if data.get("above_avg_cost") else 0,
                             "chip_high_diverge": 1 if data.get("is_high_diverge") else 0,
                             "chip_confidence": float(data.get("confidence") or 0),
-                            "chip_manual": 0,
+                            # 看图结果更精准，标记为优先（chip_manual=1）：之后『一键刷新』里的自动筹码不会覆盖它
+                            "chip_manual": 1,
                             "has_chip": 1,
                         }
                         # 从图中读到的行情/估值/资金（作为 akshare 失败时的备用来源）：只在读到数字时才写入
@@ -2146,6 +2533,7 @@ def main():
                 "avg_cost": "平均成本", "profit_ratio": "获利比例%",
                 "main_net_today": "今日主力净流入(亿)", "main_net_5d": "近5日主力净流入(亿)",
                 "margin_chg": "融资余额变化%",
+                "gdhs": "股东户数", "gdhs_chg": "股东户数变化%",
                 "chip_single_peak": "低位单峰密集", "chip_above_avg": "站上成本线",
                 "chip_high_diverge": "高位发散", "chip_confidence": "视觉置信度",
                 "has_chip": "已有筹码分析", "updated_at": "更新时间",
@@ -2153,7 +2541,7 @@ def main():
             cols = ["code", "name", "操作建议", "建议原因", "serenity_score", "is_override", "is_holding", "close",
                     "ma10", "ma20", "ma30", "npr_growth", "eps", "pe", "pe_percentile",
                     "avg_cost", "profit_ratio", "lhb_flag", "lhb_net",
-                    "main_net_today", "main_net_5d", "margin_chg",
+                    "main_net_today", "main_net_5d", "margin_chg", "gdhs", "gdhs_chg",
                     "chip_single_peak", "chip_above_avg", "chip_high_diverge",
                     "chip_confidence", "has_chip", "updated_at"]
             cols = [c for c in cols if c in show.columns or c in ("操作建议", "建议原因")]
