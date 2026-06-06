@@ -733,25 +733,38 @@ CHIP_VISION_PROMPT = """你是一位精通筹码分布（成本分布）与K线�
 资金类数值（main_net_today_yi / main_net_5d_yi）统一换算成【亿元】；若图中是"万"，请除以10000换算成亿。"""
 
 
-def call_gemini_chip(api_key, model, image_bytes):
+def call_gemini_chip(api_key, model, image_bytes, mime_type=None):
     """
     调用 Gemini 多模态分析筹码图。
     返回 (ok, result_dict, err_msg)。
+    手机端兼容：直接用『原始字节 + MIME 类型』发给 Gemini，
+    这样 iPhone 的 HEIC/HEIF、安卓的 WebP 等格式都能分析，不依赖本地 Pillow 解码。
     """
     if not _GENAI_OK:
         return False, None, "未安装 google-generativeai 库，请先 pip install。"
-    if not _PIL_OK:
-        return False, None, "未安装 Pillow 库，请先 pip install Pillow。"
     if not api_key:
         return False, None, "未填写 Gemini API Key（请在左侧边栏填写）。"
     try:
         genai.configure(api_key=api_key)
-        img = Image.open(BytesIO(image_bytes))
         gmodel = genai.GenerativeModel(model or "gemini-1.5-flash")
-        resp = gmodel.generate_content(
-            [CHIP_VISION_PROMPT, img],
-            request_options={"timeout": HTTP_TIMEOUT},
-        )
+        # MIME 兜底：拿不到或异常时按 jpeg 处理
+        if not mime_type or "/" not in str(mime_type):
+            mime_type = "image/jpeg"
+        try:
+            image_part = {"mime_type": mime_type, "data": image_bytes}
+            resp = gmodel.generate_content(
+                [CHIP_VISION_PROMPT, image_part],
+                request_options={"timeout": max(HTTP_TIMEOUT, 90)},
+            )
+        except Exception:
+            # 退路：普通 png/jpg 用 PIL 打开后再发
+            if not _PIL_OK:
+                raise
+            img = Image.open(BytesIO(image_bytes))
+            resp = gmodel.generate_content(
+                [CHIP_VISION_PROMPT, img],
+                request_options={"timeout": max(HTTP_TIMEOUT, 90)},
+            )
         text = getattr(resp, "text", None) or ""
         data = _safe_parse_json(text)
         if data is None or "is_single_peak_low" not in data:
@@ -759,6 +772,150 @@ def call_gemini_chip(api_key, model, image_bytes):
         return True, data, ""
     except Exception as e:
         return False, None, f"调用 Gemini 失败：{e}"
+
+
+def call_gemini_text(api_key, model, prompt_text, timeout=None):
+    """
+    通用 Gemini 纯文本调用（用于让 Gemini 也参与选股/买卖研判）。
+    返回 (ok, text, err)。
+    """
+    if not _GENAI_OK:
+        return False, None, "未安装 google-generativeai 库，请先 pip install。"
+    if not api_key:
+        return False, None, "未填写 Gemini API Key（请在左侧边栏填写）。"
+    try:
+        genai.configure(api_key=api_key)
+        gmodel = genai.GenerativeModel(model or "gemini-1.5-flash")
+        resp = gmodel.generate_content(
+            prompt_text,
+            request_options={"timeout": timeout or max(HTTP_TIMEOUT, 120)},
+        )
+        text = getattr(resp, "text", None) or ""
+        return True, text, ""
+    except Exception as e:
+        return False, None, f"调用 Gemini 失败：{e}"
+
+
+# ============================================================================
+# 模块3.5：双模型综合研判（DeepSeek + Gemini 一起选股 / 判断买卖）
+# ============================================================================
+
+DUAL_SELECT_PROMPT = """你是A股硬科技产业链专家，精通『紫苏叶理论』。
+紫苏叶公司标准（核心锚点业务需同时满足）：①产业链深层节点（Layer3+：底层硬件/核心材料/关键设备等"卖水人"）；②不可替代、壁垒高；③寡头垄断（有效竞争对手≤3家）。
+不要拿公司"总盘子主业"一刀切否定，要主动挖掘其内部可能藏着的"紫苏叶锚点"细分业务。
+只返回一个JSON对象（不要任何多余文字、不要markdown标记）：
+{"is_perilla": true或false, "anchor": "紫苏叶锚点业务名或null", "reason": "大白话理由，120字以内，让股票小白看懂"}"""
+
+DUAL_DECISION_PROMPT = """你是一位严格遵循『紫苏叶选股 + 戴维斯双击 + 右侧交易』的A股投资顾问。
+我会给你一只股票的关键数据，以及系统规则引擎的初步结论。请你独立判断当前应采取的操作。
+判断原则：
+- 右侧交易：股价站上20日且30日均线才考虑买入；（尤其持仓时）跌破30日均线应卖出/离场。
+- 不追高：获利盘过大、现价远高于平均成本、主力净流出、融资过热时，即使是好公司也应观望，别追。
+- 戴维斯双击（净利润同比增长高 + PE处于近3年低分位）是重要加分买点。
+- 数据缺失时要保守。
+只返回一个JSON对象（不要任何多余文字、不要markdown标记）：
+{"action": "买入" 或 "观望" 或 "卖出", "confidence": 0到1的小数, "reason": "大白话理由，120字以内，让股票小白看懂"}"""
+
+
+def dual_select(name, deepseek_key, deepseek_model, gemini_key, gemini_model):
+    """让 DeepSeek 与 Gemini 各自独立研判一家公司是否紫苏叶。返回 (ds, ds_err, gm, gm_err)。"""
+    user_msg = f"请研判这家公司：{name}"
+    # DeepSeek
+    ds, ds_err = None, ""
+    payload = {
+        "model": deepseek_model or "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": DUAL_SELECT_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    ok, content, err = _deepseek_post(payload, deepseek_key)
+    if ok:
+        ds = _safe_parse_json(content)
+        if ds is None:
+            ds_err = "DeepSeek 返回无法解析。"
+    else:
+        ds_err = err
+    # Gemini
+    gm, gm_err = None, ""
+    ok2, text, err2 = call_gemini_text(
+        gemini_key, gemini_model,
+        DUAL_SELECT_PROMPT + "\n\n" + user_msg + "\n\n请只返回JSON。",
+    )
+    if ok2:
+        gm = _safe_parse_json(text)
+        if gm is None:
+            gm_err = "Gemini 返回无法解析。"
+    else:
+        gm_err = err2
+    return ds, ds_err, gm, gm_err
+
+
+def _decision_facts(row, rule_sig, rule_reason, npr_threshold, pe_pct_threshold):
+    """把一只股票的关键数据整理成给大模型看的文字清单。"""
+    def g(k):
+        v = row.get(k)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return MISSING
+        return v
+    lines = [
+        f"股票：{row.get('name')}（{row.get('code')}）",
+        f"是否持仓：{'是' if row.get('is_holding') else '否'}",
+        f"是否符合紫苏叶（守门员判定）：{'是' if row.get('is_perilla_leaf') else '否'}"
+        + ("（注意：人类强制收编，AI 守门员原本不认）" if row.get('is_override') else ""),
+        f"收盘价：{g('close')}，MA10：{g('ma10')}，MA20：{g('ma20')}，MA30：{g('ma30')}",
+        f"净利润同比增长：{g('npr_growth')}%（买入业绩门槛：> {npr_threshold}%）",
+        f"PE：{g('pe')}，PE近3年分位：{g('pe_percentile')}%（买入估值门槛：< {pe_pct_threshold}%）",
+        f"平均成本：{g('avg_cost')}，收盘获利比例：{g('profit_ratio')}%",
+        f"龙虎榜净买入(万元)：{g('lhb_net')}，今日主力净流入(亿)：{g('main_net_today')}，"
+        f"近5日主力净流入(亿)：{g('main_net_5d')}，融资余额变化：{g('margin_chg')}%",
+        f"筹码：低位单峰密集={_chip_text(row, 'chip_single_peak')}，"
+        f"站上平均成本线={_chip_text(row, 'chip_above_avg')}，高位发散={_chip_text(row, 'chip_high_diverge')}",
+        f"系统规则引擎初步结论：{rule_sig} —— {rule_reason}",
+    ]
+    return "\n".join(str(x) for x in lines)
+
+
+def dual_decision(row, deepseek_key, deepseek_model, gemini_key, gemini_model,
+                  rule_sig, rule_reason, npr_threshold, pe_pct_threshold):
+    """让 DeepSeek 与 Gemini 各自独立给出买/卖/观望判断。返回 (ds, ds_err, gm, gm_err)。"""
+    facts = _decision_facts(row, rule_sig, rule_reason, npr_threshold, pe_pct_threshold)
+    user_msg = facts + "\n\n请给出你的操作判断。"
+    # DeepSeek
+    ds, ds_err = None, ""
+    payload = {
+        "model": deepseek_model or "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": DUAL_DECISION_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    ok, content, err = _deepseek_post(payload, deepseek_key)
+    if ok:
+        ds = _safe_parse_json(content)
+        if ds is None:
+            ds_err = "DeepSeek 返回无法解析。"
+    else:
+        ds_err = err
+    # Gemini
+    gm, gm_err = None, ""
+    ok2, text, err2 = call_gemini_text(
+        gemini_key, gemini_model,
+        DUAL_DECISION_PROMPT + "\n\n" + user_msg + "\n\n请只返回JSON。",
+    )
+    if ok2:
+        gm = _safe_parse_json(text)
+        if gm is None:
+            gm_err = "Gemini 返回无法解析。"
+    else:
+        gm_err = err2
+    return ds, ds_err, gm, gm_err
 
 
 # ============================================================================
@@ -1178,6 +1335,46 @@ def main():
                     if row.get("analysis"):
                         st.markdown(f"**AI 选股理由：** {row.get('analysis')}")
 
+                # ===== 🤝 双AI复核：让 DeepSeek + Gemini 一起判断买卖 =====
+                with st.expander("🤝 让两个AI（DeepSeek + Gemini）一起复核买卖"):
+                    st.caption("上面的结论由『规则引擎』给出。点下面按钮，让两个大模型各自独立再判一次，"
+                               "三方一起看更稳。意见一致更可信；分歧时建议谨慎、多看少动。")
+                    code_k = row.get("code")
+                    if st.button("开始双AI复核", key=f"dual_btn_{code_k}"):
+                        with st.spinner("两个AI正在独立研判…"):
+                            ds, ds_err, gm, gm_err = dual_decision(
+                                row, deepseek_key, deepseek_model, gemini_key, gemini_model,
+                                sig, reason, npr_threshold, pe_pct_threshold,
+                            )
+                        st.session_state[f"dualres_{code_k}"] = (ds, ds_err, gm, gm_err)
+                    res = st.session_state.get(f"dualres_{code_k}")
+                    if res:
+                        ds, ds_err, gm, gm_err = res
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            st.markdown("**🟦 DeepSeek 的意见**")
+                            if ds:
+                                st.markdown(f"动作：**{ds.get('action', '—')}**"
+                                            f"（把握 {round(float(ds.get('confidence') or 0)*100)}%）")
+                                st.caption(ds.get("reason", ""))
+                            else:
+                                st.error(ds_err or "未获取到结果")
+                        with cc2:
+                            st.markdown("**🟩 Gemini 的意见**")
+                            if gm:
+                                st.markdown(f"动作：**{gm.get('action', '—')}**"
+                                            f"（把握 {round(float(gm.get('confidence') or 0)*100)}%）")
+                                st.caption(gm.get("reason", ""))
+                            else:
+                                st.error(gm_err or "未获取到结果")
+                        if ds and gm:
+                            a1, a2 = ds.get("action"), gm.get("action")
+                            if a1 == a2:
+                                st.success(f"✅ 两个AI意见一致：都建议「{a1}」。可结合上方规则引擎结论一起参考。")
+                            else:
+                                st.warning(f"⚠️ 两个AI意见有分歧：DeepSeek 说「{a1}」，Gemini 说「{a2}」。"
+                                           "分歧时更要谨慎，建议多看少动、等信号更明确再决定。")
+
     # ===== Tab2：加自选股（多轮对话投研 Agent） =====
     with tab_add:
         st.subheader("🛡️ 加自选股 —— 和 AI 投研伙伴聊出来")
@@ -1241,6 +1438,61 @@ def main():
                             upsert_stock(code, name or code, True, full_analysis)
                             st.success(f"✅ 已按『{anchor or '该逻辑'}』把 {name}({code}) 入池！"
                                        "下一步：左侧『🔄 一键刷新全池数据』拉行情，再到『🖼️ 上传筹码图』补筹码。")
+
+        # ===== 🤝 双AI选股快速把关：DeepSeek + Gemini 各自独立研判是否紫苏叶 =====
+        st.divider()
+        with st.expander("🤝 双AI选股把关（DeepSeek + Gemini 同时判断是否紫苏叶）"):
+            st.caption("上面的对话由 DeepSeek 主导。想让两个AI同时给意见？在这里输入公司名，"
+                       "它们各自独立判断是否符合紫苏叶。两个都认 → 更靠谱；意见不一 → 要多想想。")
+            ds_name = st.text_input("公司名 / 代码", key="dual_sel_name", placeholder="如 双环传动 或 002472")
+            if st.button("让两个AI一起研判", key="dual_sel_btn", type="primary"):
+                if not ds_name.strip():
+                    st.warning("请先输入公司名或代码。")
+                else:
+                    with st.spinner("两个AI正在独立研判…"):
+                        ds, ds_err, gm, gm_err = dual_select(
+                            ds_name.strip(), deepseek_key, deepseek_model, gemini_key, gemini_model
+                        )
+                    st.session_state["dual_sel_res"] = (ds_name.strip(), ds, ds_err, gm, gm_err)
+            sres = st.session_state.get("dual_sel_res")
+            if sres:
+                sname, ds, ds_err, gm, gm_err = sres
+                st.markdown(f"**研判对象：{sname}**")
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    st.markdown("**🟦 DeepSeek**")
+                    if ds:
+                        st.markdown("结论：**" + ("✅ 是紫苏叶" if ds.get("is_perilla") else "❌ 不算紫苏叶") + "**")
+                        if ds.get("anchor"):
+                            st.caption(f"锚点：{ds.get('anchor')}")
+                        st.caption(ds.get("reason", ""))
+                    else:
+                        st.error(ds_err or "未获取到结果")
+                with sc2:
+                    st.markdown("**🟩 Gemini**")
+                    if gm:
+                        st.markdown("结论：**" + ("✅ 是紫苏叶" if gm.get("is_perilla") else "❌ 不算紫苏叶") + "**")
+                        if gm.get("anchor"):
+                            st.caption(f"锚点：{gm.get('anchor')}")
+                        st.caption(gm.get("reason", ""))
+                    else:
+                        st.error(gm_err or "未获取到结果")
+                if ds and gm:
+                    if bool(ds.get("is_perilla")) == bool(gm.get("is_perilla")):
+                        verdict = "都认为是紫苏叶 ✅" if ds.get("is_perilla") else "都认为不算 ❌"
+                        st.success(f"两个AI意见一致：{verdict}。")
+                    else:
+                        st.warning("两个AI意见不一致，建议回到上方对话框，让 DeepSeek 帮你深入拆解再定。")
+                # 一致认可时给个一键入库入口
+                if ds and gm and ds.get("is_perilla") and gm.get("is_perilla"):
+                    code_guess = _extract_code(sname) or ""
+                    anchor = ds.get("anchor") or gm.get("anchor") or ""
+                    if code_guess and st.button(f"➕ 两个AI都认可，入池 {sname}", key="dual_sel_add"):
+                        full = f"【紫苏叶锚点：{anchor}】DeepSeek与Gemini双模型一致认可。" if anchor else "DeepSeek与Gemini双模型一致认可。"
+                        upsert_stock(code_guess, sname, True, full)
+                        st.success(f"✅ 已入池 {sname}({code_guess})！请到左侧『🔄 一键刷新全池数据』拉行情。")
+                    elif not code_guess:
+                        st.info("两个AI都认可。请在上面输入框补上6位代码（如 002472）再研判一次，即可一键入池。")
 
         # ===== 👑 强制收编（上帝模式）：AI 实在不认时的兜底 =====
         st.divider()
@@ -1367,13 +1619,19 @@ def main():
                 except Exception:
                     return None
 
-            up = st.file_uploader("上传筹码分布图（png/jpg）", type=["png", "jpg", "jpeg"])
+            up = st.file_uploader(
+                "上传筹码分布图（支持手机拍照/相册：png/jpg/heic/webp 等）",
+                type=["png", "jpg", "jpeg", "webp", "bmp", "gif", "heic", "heif"],
+                help="手机用户：iPhone 默认照片是 HEIC 格式，现在也能直接上传分析。若相册照片选不中，可改用『截图』再上传。",
+            )
             if up is not None:
                 # 分析按钮紧挨上传框，放在图片预览上方，省得上传后还要往下滚很久
                 do_analyze = st.button("🤖 让 AI 分析这张图")
                 if do_analyze:
                     with st.spinner("视觉模型分析中…"):
-                        ok, data, err = call_gemini_chip(gemini_key, gemini_model, up.getvalue())
+                        ok, data, err = call_gemini_chip(
+                            gemini_key, gemini_model, up.getvalue(), getattr(up, "type", None)
+                        )
                     if not ok:
                         st.error(err)
                     else:
@@ -1470,8 +1728,11 @@ def main():
                                 st.success(f"已手动保存 {len(to_save)} 项数据，将直接参与买卖决策。"
                                            "可到『🎯 今日操作建议』查看更新后的结论。")
 
-                # 图片预览放在按钮/结果下方，作为参考
-                st.image(up, caption="你上传的筹码图", use_container_width=True)
+                # 图片预览放在按钮/结果下方，作为参考（HEIC 等格式浏览器可能无法预览，不影响分析）
+                try:
+                    st.image(up, caption="你上传的筹码图", use_container_width=True)
+                except Exception:
+                    st.caption("（这张图是 HEIC 等手机格式，浏览器无法直接预览，但不影响上方 AI 分析。）")
 
             # 人工修正区（人工值优先于模型值）
             st.divider()
