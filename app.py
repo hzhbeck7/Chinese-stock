@@ -441,6 +441,10 @@ PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专�
 2. 产品/技术不可替代，技术壁垒或专利护城河高。
 3. 寡头垄断格局（全球或国内有效竞争对手 <= 3 家）。
 
+""" + SERENITY_FRAMEWORK + """
+
+""" + SERENITY_SCORE_GUIDE + """
+
 【任务——三步思维链】：
 第一步：识别当前A股市场最核心的 3 到 5 个硬科技热门赛道（要多元，不要只盯机器人；可考虑如固态电池、低空经济、商业航天、合成生物、AI算力/光模块、半导体设备/材料、可控核聚变等当下真实热门方向）。
 第二步：在每个赛道里，用紫苏叶理论深度挖掘那条"别人离不开、卡脖子、玩家极少"的底层环节。
@@ -457,9 +461,14 @@ PERILLA_MINER_PROMPT = """你是一位顶级的A股硬科技产业链投研专�
        {
          "name": "公司中文简称",
          "code": "6位股票代码",
-         "bottleneck": "它卡的是哪个脖子/处在哪个底层节点（大白话）",
+         "chain_layer": "卡在产业链第几层（如：第4层 芯片/器件）",
+         "bottleneck": "它卡的是哪个脖子/处在哪个底层节点（大白话），并点明命中哪几条卡脖子特征",
          "competitors": "全球或国内的有效竞争对手大致有哪几家（体现玩家极少）",
-         "reason": "用大白话总结为什么它符合紫苏叶标准，100字内，让股票小白也能看懂"
+         "reason": "用大白话总结为什么它符合紫苏叶标准，100字内，让股票小白也能看懂",
+         "thesis_breaker": "⚠️这套逻辑的死穴：什么情况一旦发生，就说明看错了/该回避（如：被某新技术替代、对手扩产、客户自研），大白话，60字内",
+         "confidence": "证据可信度，只能填三选一：已确认 / 推断 / 待核实（'已确认'=公认事实；'推断'=你的合理推断；'待核实'=不太确定）",
+         "factors": {"需求拐点":0-5, "架构耦合":0-5, "卡脖子严重度":0-5, "供应商集中度":0-5, "扩产难度":0-5, "证据质量":0-5, "估值偏离":0-5, "催化时机":0-5},
+         "penalties": {"增发摊薄":0-5, "公司治理":0-5, "炒作过热":0-5, "财务质量":0-5}
        }
      ]
    }
@@ -1859,25 +1868,70 @@ def main():
                 # 已入池代码，用来判断哪些已经收编过
                 _pool_df = load_pool_df()
                 pooled = set(_pool_df["code"].astype(str).tolist()) if not _pool_df.empty else set()
-                st.success(f"挖掘完成！AI 扫描出 {len(sectors)} 个热门赛道，结果如下：")
-                st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局可能有误，收编前请自行核对。")
-                for si, sec in enumerate(sectors):
+
+                # 证据可信度 → 大白话标签
+                def _conf_badge(c):
+                    c = (c or "").strip()
+                    if "已确认" in c:
+                        return "✅ 已确认事实"
+                    if "推断" in c:
+                        return "🟡 AI推断（仅供参考）"
+                    if "待核实" in c or "核实" in c:
+                        return "⚠️ 待核实（别全信）"
+                    return "🟡 AI推断（仅供参考）"
+
+                # 预先为每只股算紫苏叶评分，并算出每个赛道的平均分用于排序
+                for sec in sectors:
+                    stks = sec.get("stocks", []) or []
+                    scores = []
+                    for stk in stks:
+                        if stk.get("factors"):
+                            sc_v, detail_v = serenity_score(stk.get("factors"), stk.get("penalties"))
+                            stk["_score"] = sc_v
+                            stk["_detail"] = detail_v
+                            scores.append(sc_v)
+                        else:
+                            stk["_score"] = None
+                    # 赛道内按评分高→低排序（无分排最后）
+                    sec["stocks"] = sorted(stks, key=lambda s: -(s.get("_score") or -1))
+                    sec["_avg"] = round(sum(scores) / len(scores)) if scores else None
+
+                # 赛道按平均分高→低排序，让最值得看的赛道排最前
+                sectors_sorted = sorted(sectors, key=lambda x: -(x.get("_avg") or -1))
+
+                st.success(f"挖掘完成！AI 扫描出 {len(sectors_sorted)} 个热门赛道，已按『紫苏叶评分』从高到低排好序：")
+                st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局/评分可能有误，收编前请自行核对。评分越高=卡位越硬越值得关注。")
+                for si, sec in enumerate(sectors_sorted):
                     sname = sec.get("sector", "未知赛道")
-                    with st.expander(f"🔥 {sname}", expanded=True):
+                    avg = sec.get("_avg")
+                    avg_tag = f"（赛道均分 {avg}/100 · {serenity_grade(avg)}）" if avg is not None else ""
+                    with st.expander(f"🔥 {sname} {avg_tag}", expanded=True):
                         if sec.get("logic"):
                             st.markdown(f"**赛道紫苏叶逻辑：** {sec.get('logic')}")
                         for sti, stk in enumerate(sec.get("stocks", [])):
                             name = stk.get("name") or ""
                             code = str(stk.get("code") or "")
+                            sc_v = stk.get("_score")
+                            score_html = (f"<span style='background:#1a3c8c;color:#fff;border-radius:8px;"
+                                          f"padding:1px 8px;font-size:14px;margin-left:8px;'>🌿 {sc_v}/100 · {serenity_grade(sc_v)}</span>"
+                                          if sc_v is not None else
+                                          "<span style='background:#bbb;color:#fff;border-radius:8px;padding:1px 8px;font-size:13px;margin-left:8px;'>未评分</span>")
+                            layer = stk.get("chain_layer") or "—"
+                            breaker = stk.get("thesis_breaker") or "—"
+                            conf = _conf_badge(stk.get("confidence"))
                             st.markdown(
                                 f"<div style='background:#f6f9ff;border:1px solid #d6e4ff;"
                                 f"border-radius:10px;padding:12px 14px;margin:8px 0;'>"
                                 f"<div style='font-size:17px;font-weight:800;color:#1a3c8c;'>"
-                                f"📌 {name}（{code}）</div>"
+                                f"📌 {name}（{code}）{score_html}</div>"
                                 f"<div style='margin-top:6px;line-height:1.6;'>"
+                                f"<b>产业链卡位：</b>{layer}<br>"
                                 f"<b>卡脖子/底层节点：</b>{stk.get('bottleneck','—')}<br>"
                                 f"<b>主要竞争对手：</b>{stk.get('competitors','—')}<br>"
-                                f"<b>紫苏叶理由：</b>{stk.get('reason','—')}</div></div>",
+                                f"<b>紫苏叶理由：</b>{stk.get('reason','—')}<br>"
+                                f"<b>证据可信度：</b>{conf}<br>"
+                                f"<span style='color:#b00020;'><b>⚠️ 这套逻辑的死穴：</b>{breaker}</span>"
+                                f"</div></div>",
                                 unsafe_allow_html=True,
                             )
                             already = code in pooled
@@ -1888,10 +1942,12 @@ def main():
                                 st.caption("（缺少股票代码，无法一键收编）")
                             else:
                                 if st.button(f"➕ 一键收编入库：{name}", key=btn_key):
-                                    reason = (f"【AI赛道挖掘·{sname}】卡脖子节点：{stk.get('bottleneck','')}；"
-                                              f"竞争对手：{stk.get('competitors','')}；"
-                                              f"{stk.get('reason','')}")
+                                    reason = (f"【AI赛道挖掘·{sname}】{layer}｜卡脖子节点：{stk.get('bottleneck','')}；"
+                                              f"竞争对手：{stk.get('competitors','')}；{stk.get('reason','')}"
+                                              f"（⚠️逻辑死穴：{breaker}）")
                                     upsert_stock(code, name or code, True, reason)
+                                    # 把挖掘时算好的评分一并写库（入池即带分）
+                                    compute_and_save_score(code, stk.get("factors"), stk.get("penalties"))
                                     st.success(f"已把 {name}({code}) 收编入池！请到左侧『🔄 一键刷新全池数据』拉行情，"
                                                "再到『🖼️ 上传筹码图』补筹码。")
                                     st.rerun()
