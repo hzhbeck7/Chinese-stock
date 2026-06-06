@@ -1503,7 +1503,11 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
                     if davis:
                         why.append("业绩大涨且估值偏低（戴维斯双击）")
                     if strong_score:
-                        why.append(f"产业链卡位极硬（紫苏叶评分 {int(float(sc))} 分，{serenity_grade(sc)}）")
+                        try:
+                            _sc_str = f"{int(float(sc))} 分"
+                        except (TypeError, ValueError):
+                            _sc_str = "高分"
+                        why.append(f"产业链卡位极硬（紫苏叶评分 {_sc_str}，{serenity_grade(sc)}）")
                     return "强烈买入", "符合紫苏叶好公司，且股价站上均线，又叠加" + "、".join(why) + "，是难得的好买点，可分批建仓。" + chip_hint
                 return "分批建仓买入", f"这是符合紫苏叶标准的好公司，股价（{close}）已站上20日和30日均价线，进入右侧上涨，可分批建仓买入。{chip_hint}"
         elif close < ma30:
@@ -1652,10 +1656,15 @@ def render_signal_card(row, signal_key, reason):
     override_tag = " 👑人类强制收编" if row.get("is_override") else ""
     # 紫苏叶评分徽章（卡位有多硬），无评分时给提示
     _sc = row.get("serenity_score")
-    if _sc is not None:
+    try:
+        _sc_int = int(float(_sc))  # NaN / None 均会抛异常，统一进 except
+        _sc_valid = True
+    except (TypeError, ValueError):
+        _sc_valid = False
+    if _sc_valid:
         score_badge = (f'<span style="background:rgba(255,255,255,0.25);border-radius:8px;'
                        f'padding:2px 10px;font-size:15px;font-weight:700;margin-left:8px;">'
-                       f'🌿 紫苏叶评分 {int(float(_sc))}/100 · {serenity_grade(_sc)}</span>')
+                       f'🌿 紫苏叶评分 {_sc_int}/100 · {serenity_grade(_sc)}</span>')
     else:
         score_badge = ('<span style="background:rgba(255,255,255,0.18);border-radius:8px;'
                        'padding:2px 10px;font-size:14px;margin-left:8px;">🌿 未评分（重新研判可生成）</span>')
@@ -1934,7 +1943,7 @@ def main():
                     st.write({
                         "纳入方式": "👑 人类强制收编（无视AI拒绝）" if row.get("is_override") else "AI 守门员通过",
                         "🌿紫苏叶评分": (f"{int(float(_sc))}/100（{serenity_grade(_sc)}）"
-                                      if _sc is not None else "未评分（重新研判即可生成）"),
+                                      if _sc is not None and not (isinstance(_sc, float) and pd.isna(_sc)) else "未评分（重新研判即可生成）"),
                         "最新收盘价": fmt(row.get("close")),
                         "10日均价线": fmt(row.get("ma10")),
                         "20日均价线": fmt(row.get("ma20")),
