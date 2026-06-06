@@ -100,6 +100,7 @@ def init_db():
             analysis         TEXT,               -- 守门员分析理由
             is_holding       INTEGER DEFAULT 0,  -- 是否已持仓（1是/0否）
             npr_growth       REAL,               -- 净利润同比增长率（%）
+            eps              REAL,               -- 基本每股收益 EPS（同花顺源，最新报告期）
             pe               REAL,               -- 当前市盈率 PE
             pe_percentile    REAL,               -- PE 处于近3年的分位（%）
             close            REAL,               -- 最新收盘价
@@ -127,7 +128,7 @@ def init_db():
     # 轻量迁移：给"老数据库"补上后来新增的列（列已存在会报错，忽略即可）
     for col, typ in [("avg_cost", "REAL"), ("profit_ratio", "REAL"), ("lhb_net", "REAL"),
                      ("main_net_today", "REAL"), ("main_net_5d", "REAL"), ("margin_chg", "REAL"),
-                     ("is_override", "INTEGER DEFAULT 0")]:
+                     ("is_override", "INTEGER DEFAULT 0"), ("eps", "REAL")]:
         try:
             cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
         except Exception:
@@ -584,33 +585,57 @@ def fetch_price_ma(code):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_npr_growth(code):
     """
-    拉取净利润同比增长率（%）。主用 stock_financial_abstract，失败返回 None。
-    （注：作为需求中 EPS 增长率的代理指标，口径为净利润同比。）
+    拉取『净利润同比增长率（%）』与『基本每股收益 EPS』。
+    返回二元组 (npr_growth, eps)；任一取不到则该项为 None，全失败返回 (None, None)。
+
+    数据源优先级：
+      主源：同花顺网页财务摘要 stock_financial_abstract_ths（含真实 EPS，更贴合需求口径）
+      备源1：东方财富财务摘要 stock_financial_abstract（仅净利润同比，EPS 取不到给 None）
+      备源2：东方财富业绩报表 stock_yjbb_em（仅净利润同比）
     """
     ak = _get_akshare()
     if ak is None:
-        return None
-    # 方案A：财务摘要
+        return None, None
+    c = str(code).zfill(6)
+
+    # ---- 主源：同花顺网页（行序为旧→新，最后一行=最新报告期）----
     try:
-        df = ak.stock_financial_abstract(symbol=code)
+        df = ak.stock_financial_abstract_ths(symbol=c, indicator="按报告期")
         if df is not None and not df.empty:
-            # 不同版本列名可能不同，模糊查找含"净利润"且含"同比"的行/列
-            txt_cols = [c for c in df.columns if isinstance(c, str)]
-            # 形态1：含"指标"列的长表
-            if "指标" in df.columns:
-                mask = df["指标"].astype(str).str.contains("净利润") & \
-                       df["指标"].astype(str).str.contains("同比|增长")
-                sub = df[mask]
-                if not sub.empty:
-                    # 取最右侧（最新）一个非空数值
-                    row = sub.iloc[0]
-                    for v in reversed(list(row.values)):
-                        val = _to_float_pct(v)
-                        if val is not None:
-                            return val
+            npr = None
+            eps = None
+            # 净利润同比增长率：从最后一行（最新）往前找首个可解析值
+            if "净利润同比增长率" in df.columns:
+                for v in reversed(list(df["净利润同比增长率"].values)):
+                    val = _to_float_pct(v)
+                    if val is not None:
+                        npr = val
+                        break
+            # 基本每股收益：取最新一行（最后一行）
+            if "基本每股收益" in df.columns:
+                eps = _to_float_pct(df["基本每股收益"].iloc[-1])
+            if npr is not None or eps is not None:
+                return npr, eps
     except Exception:
         pass
-    # 方案B：业绩报表
+
+    # ---- 备源1：东方财富财务摘要（仅净利润同比）----
+    try:
+        df = ak.stock_financial_abstract(symbol=code)
+        if df is not None and not df.empty and "指标" in df.columns:
+            mask = df["指标"].astype(str).str.contains("净利润") & \
+                   df["指标"].astype(str).str.contains("同比|增长")
+            sub = df[mask]
+            if not sub.empty:
+                row = sub.iloc[0]
+                for v in reversed(list(row.values)):
+                    val = _to_float_pct(v)
+                    if val is not None:
+                        return val, None
+    except Exception:
+        pass
+
+    # ---- 备源2：东方财富业绩报表（仅净利润同比）----
     try:
         year = datetime.date.today().year
         for q_date in [f"{year}0331", f"{year-1}1231", f"{year-1}0930"]:
@@ -621,16 +646,17 @@ def fetch_npr_growth(code):
             if df is None or df.empty:
                 continue
             code_col = "股票代码" if "股票代码" in df.columns else df.columns[1]
-            row = df[df[code_col].astype(str).str.zfill(6) == code]
+            row = df[df[code_col].astype(str).str.zfill(6) == c]
             if not row.empty:
-                for c in df.columns:
-                    if "净利润" in str(c) and ("同比" in str(c) or "增长" in str(c)):
-                        val = _to_float_pct(row.iloc[0][c])
+                for col in df.columns:
+                    if "净利润" in str(col) and ("同比" in str(col) or "增长" in str(col)):
+                        val = _to_float_pct(row.iloc[0][col])
                         if val is not None:
-                            return val
+                            return val, None
     except Exception:
         pass
-    return None
+
+    return None, None
 
 
 def _pe_pct_from_series(df, date_col, pe_col):
@@ -748,10 +774,12 @@ def refresh_one_stock(code):
     except Exception:
         pass
 
-    # 净利润同比增长
-    npr = fetch_npr_growth(code)
+    # 净利润同比增长 + 基本每股收益 EPS（同花顺源）
+    npr, eps = fetch_npr_growth(code)
     if npr is not None:
         fields["npr_growth"] = npr
+    if eps is not None:
+        fields["eps"] = eps
 
     # PE 与近3年分位
     pe, pe_pct = fetch_pe_percentile(code)
@@ -1384,7 +1412,8 @@ def main():
                         "10日均价线": fmt(row.get("ma10")),
                         "20日均价线": fmt(row.get("ma20")),
                         "30日均价线": fmt(row.get("ma30")),
-                        "净利润同比增长(口径:净利润，代理EPS)": fmt(row.get("npr_growth"), "%"),
+                        "净利润同比增长(同花顺源)": fmt(row.get("npr_growth"), "%"),
+                        "每股收益EPS(同花顺)": fmt(row.get("eps")),
                         "当前PE": fmt(row.get("pe")),
                         "PE近3年分位": fmt(row.get("pe_percentile"), "%"),
                         "市场平均成本": fmt(row.get("avg_cost")),
@@ -1766,6 +1795,7 @@ def main():
                             in_pe = st.number_input("市盈率 PE", value=_cur_num("pe"), step=0.01, format="%.2f")
                             in_pepct = st.number_input("PE近3年分位（%）", value=_cur_num("pe_percentile"), step=0.1, format="%.1f")
                             in_npr = st.number_input("净利润同比增长（%）", value=_cur_num("npr_growth"), step=0.1, format="%.1f")
+                            in_eps = st.number_input("每股收益 EPS", value=_cur_num("eps"), step=0.01, format="%.2f")
                             in_avg = st.number_input("平均成本", value=_cur_num("avg_cost"), step=0.01, format="%.2f")
                         with fc:
                             in_profit = st.number_input("获利比例（%）", value=_cur_num("profit_ratio"), step=0.1, format="%.1f")
@@ -1778,7 +1808,7 @@ def main():
                         if submitted:
                             mapping = {
                                 "close": in_close, "ma10": in_ma10, "ma20": in_ma20, "ma30": in_ma30,
-                                "pe": in_pe, "pe_percentile": in_pepct, "npr_growth": in_npr,
+                                "pe": in_pe, "pe_percentile": in_pepct, "npr_growth": in_npr, "eps": in_eps,
                                 "avg_cost": in_avg, "profit_ratio": in_profit, "lhb_net": in_lhb,
                                 "main_net_today": in_m1, "main_net_5d": in_m5, "margin_chg": in_margin,
                             }
@@ -1848,7 +1878,7 @@ def main():
             rename = {
                 "code": "代码", "name": "名称", "is_holding": "已持仓",
                 "is_override": "👑强制收编",
-                "npr_growth": "净利润同比增长%", "pe": "PE", "pe_percentile": "PE近3年分位%",
+                "npr_growth": "净利润同比增长%", "eps": "每股收益EPS", "pe": "PE", "pe_percentile": "PE近3年分位%",
                 "close": "收盘价", "ma10": "MA10(10日均价)", "ma20": "MA20(20日均价)",
                 "ma30": "MA30(30日均价)", "lhb_flag": "上龙虎榜", "lhb_net": "龙虎榜净买入(万)",
                 "avg_cost": "平均成本", "profit_ratio": "获利比例%",
@@ -1859,7 +1889,7 @@ def main():
                 "has_chip": "已有筹码分析", "updated_at": "更新时间",
             }
             cols = ["code", "name", "操作建议", "建议原因", "is_override", "is_holding", "close",
-                    "ma10", "ma20", "ma30", "npr_growth", "pe", "pe_percentile",
+                    "ma10", "ma20", "ma30", "npr_growth", "eps", "pe", "pe_percentile",
                     "avg_cost", "profit_ratio", "lhb_flag", "lhb_net",
                     "main_net_today", "main_net_5d", "margin_chg",
                     "chip_single_peak", "chip_above_avg", "chip_high_diverge",
