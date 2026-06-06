@@ -9,7 +9,10 @@
       "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python -c \"import akshare as ak; fns=[f for f in dir\\(ak\\) if f.endswith\\('_lg'\\) or 'value' in f.lower\\(\\) or 'valuation' in f.lower\\(\\) or 'gpr' in f.lower\\(\\)]; print\\('\\\\n'.join\\(fns\\)\\)\")",
       "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag2.py)",
       "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag3.py)",
-      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag4.py)"
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag4.py)",
+      "Bash(gh repo *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

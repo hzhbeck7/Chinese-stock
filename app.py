@@ -128,7 +128,8 @@ def init_db():
     # 轻量迁移：给"老数据库"补上后来新增的列（列已存在会报错，忽略即可）
     for col, typ in [("avg_cost", "REAL"), ("profit_ratio", "REAL"), ("lhb_net", "REAL"),
                      ("main_net_today", "REAL"), ("main_net_5d", "REAL"), ("margin_chg", "REAL"),
-                     ("is_override", "INTEGER DEFAULT 0"), ("eps", "REAL")]:
+                     ("is_override", "INTEGER DEFAULT 0"), ("eps", "REAL"),
+                     ("serenity_score", "REAL"), ("score_detail", "TEXT")]:
         try:
             cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
         except Exception:
@@ -273,15 +274,40 @@ def toggle_holding(code, is_holding):
 # 模块1：紫苏叶守门员（DeepSeek 基本面研判）
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# 借鉴 serenity-skill（供应链瓶颈/卡脖子方法论）的两段共享研判框架。
+# 注入到各个研判提示词里，让 AI 不只答"是/否"，而要说清"卡在第几层、命中哪些稀缺特征"。
+# ----------------------------------------------------------------------------
+SERENITY_FRAMEWORK = """【产业链 8 层分解】请把锚点业务定位到下面某一层（越靠上游、越底层，往往越稀缺）：
+1.下游需求（终端应用/品牌） 2.系统集成（整机/方案） 3.模组子系统 4.芯片/器件
+5.工艺/封装 6.设备/测试 7.材料/耗材 8.基础设施（电力、散热、产能等）
+注意：不要被"AI芯片""新能源"这种大筐迷惑，要拆细——比如AI算力要拆成算力芯片/存储/EDA与IP/光模块/PCB与覆铜板/电源等，分别看谁更卡脖子。
+
+【卡脖子 9 大特征】命中越多越稀缺、越像紫苏叶（请在理由里点明命中了哪几条）：
+①供应商家数极少 ②客户认证/导入周期长 ③扩产难、经济性差 ④独家工艺know-how
+⑤材料纯度/良率要求极高 ⑥强依赖专用设备 ⑦客户认证壁垒高、粘性强 ⑧交货周期长 ⑨产能需提前锁定/预定"""
+
+# 8 维度评分 + 风险扣分的说明（注入到要求 AI 打分的提示词里）
+SERENITY_SCORE_GUIDE = """【请给 8 个维度各打 0~5 分（整数）】含义：
+需求拐点=下游需求是否正在加速放量；架构耦合=该环节是否被新技术架构强绑定、绕不开；
+卡脖子严重度=供给有多紧、多难替代；供应商集中度=有效玩家是否极少；扩产难度=想扩产有多难；
+证据质量=支撑判断的公开证据是否扎实；估值偏离=当前估值相对基本面是否便宜；催化时机=未来3~12月是否有明确催化。
+【再给 4 项风险各打 0~5 分（整数，越高越糟，会扣分）】：增发摊薄、公司治理、炒作过热、财务质量。
+打分原则：没把握就给 2~3 分，不要动不动给满分。"""
+
 PERILLA_SYSTEM_PROMPT = """你是一位顶级的A股硬科技产业链研究专家，精通"紫苏叶理论"。
 "紫苏叶公司"的严格标准（必须同时满足）：
 1. 处于产业链的深层节点（Layer3 及以下，即底层硬件、核心材料、关键设备等"卖水人"角色），而非终端品牌或应用层。
 2. 产品/技术不可替代，具有很高的技术壁垒或专利护城河。
 3. 处于寡头垄断格局（全球或国内有效竞争对手 <= 3 家）。
 
+""" + SERENITY_FRAMEWORK + """
+
+""" + SERENITY_SCORE_GUIDE + """
+
 请基于你的知识，判断用户给出的公司是否符合"紫苏叶公司"标准。
 你必须只返回一个 JSON 对象，不要任何额外文字、不要markdown代码块标记，格式严格如下：
-{"is_perilla_leaf": true 或 false, "name": "公司中文简称", "analysis": "用通俗易懂的大白话解释判断理由，150字以内，让股票小白也能看懂"}
+{"is_perilla_leaf": true 或 false, "name": "公司中文简称", "chain_layer": "锚点业务卡在第几层（如：第4层 芯片/器件）", "analysis": "用通俗易懂的大白话解释判断理由，并点明卡在第几层、命中了哪几条卡脖子特征，150字以内，让股票小白也能看懂", "factors": {"需求拐点":0-5, "架构耦合":0-5, "卡脖子严重度":0-5, "供应商集中度":0-5, "扩产难度":0-5, "证据质量":0-5, "估值偏离":0-5, "催化时机":0-5}, "penalties": {"增发摊薄":0-5, "公司治理":0-5, "炒作过热":0-5, "财务质量":0-5}}
 """
 
 
@@ -349,6 +375,8 @@ PERILLA_AGENT_PROMPT = """你是一位顶级的A股硬科技产业链投研 Agen
 2. 产品/技术不可替代，技术壁垒或专利护城河高。
 3. 寡头垄断格局（全球或国内有效竞争对手 <= 3 家）。
 
+""" + SERENITY_FRAMEWORK + """
+
 【你的工作方式——非常重要】：
 不要拿一家公司的"总盘子业务"去一刀切地否定它。很多公司主业是红海（如汽车齿轮、消费电子组装），
 但其内部往往藏着一条符合紫苏叶特征的"核心零部件/隐藏业务"。你必须：
@@ -367,11 +395,16 @@ PERILLA_AGENT_PROMPT = """你是一位顶级的A股硬科技产业链投研 Agen
  "code": "6位股票代码或 null",
  "name": "公司中文简称或 null",
  "anchor": "确认入池时的紫苏叶锚点业务名称（如 RV减速器）或 null",
- "analysis": "确认入池时，用大白话总结『为什么锚定该细分业务它就算紫苏叶』，150字内；未入池则 null"
+ "analysis": "确认入池时，用大白话总结『为什么锚定该细分业务它就算紫苏叶』，150字内；未入池则 null",
+ "chain_layer": "确认入池时，锚点业务卡在第几层（如：第4层 芯片/器件）；未入池则 null",
+ "factors": 确认入池时给出 {"需求拐点":0-5,"架构耦合":0-5,"卡脖子严重度":0-5,"供应商集中度":0-5,"扩产难度":0-5,"证据质量":0-5,"估值偏离":0-5,"催化时机":0-5}；未入池则 null,
+ "penalties": 确认入池时给出 {"增发摊薄":0-5,"公司治理":0-5,"炒作过热":0-5,"财务质量":0-5}；未入池则 null
 }
+
+""" + SERENITY_SCORE_GUIDE + """
 规则：
 - 第一次收到一个公司时，先做拆解+提出锚点建议并询问，ready_to_add 必须为 false。
-- 只有当最近一条用户消息表达了同意（如"同意""就按这个逻辑来""可以""加进去"）时，ready_to_add 才设为 true，并把 code/name/anchor/analysis 填全。
+- 只有当最近一条用户消息表达了同意（如"同意""就按这个逻辑来""可以""加进去"）时，ready_to_add 才设为 true，并把 code/name/anchor/analysis/chain_layer/factors/penalties 填全。
 - 用户否定或提出新方向时，ready_to_add 为 false，在 reply 里重新评估。
 """
 
@@ -897,8 +930,12 @@ def call_gemini_text(api_key, model, prompt_text, timeout=None):
 DUAL_SELECT_PROMPT = """你是A股硬科技产业链专家，精通『紫苏叶理论』。
 紫苏叶公司标准（核心锚点业务需同时满足）：①产业链深层节点（Layer3+：底层硬件/核心材料/关键设备等"卖水人"）；②不可替代、壁垒高；③寡头垄断（有效竞争对手≤3家）。
 不要拿公司"总盘子主业"一刀切否定，要主动挖掘其内部可能藏着的"紫苏叶锚点"细分业务。
+
+""" + SERENITY_FRAMEWORK + """
+
+""" + SERENITY_SCORE_GUIDE + """
 只返回一个JSON对象（不要任何多余文字、不要markdown标记）：
-{"is_perilla": true或false, "anchor": "紫苏叶锚点业务名或null", "reason": "大白话理由，120字以内，让股票小白看懂"}"""
+{"is_perilla": true或false, "anchor": "紫苏叶锚点业务名或null", "chain_layer": "卡在第几层（如：第4层 芯片/器件）", "reason": "大白话理由，点明卡在第几层、命中哪几条卡脖子特征，120字以内，让股票小白看懂", "factors": {"需求拐点":0-5,"架构耦合":0-5,"卡脖子严重度":0-5,"供应商集中度":0-5,"扩产难度":0-5,"证据质量":0-5,"估值偏离":0-5,"催化时机":0-5}, "penalties": {"增发摊薄":0-5,"公司治理":0-5,"炒作过热":0-5,"财务质量":0-5}}"""
 
 DUAL_DECISION_PROMPT = """你是一位严格遵循『紫苏叶选股 + 戴维斯双击 + 右侧交易』的A股投资顾问。
 我会给你一只股票的关键数据，以及系统规则引擎的初步结论。请你独立判断当前应采取的操作。
@@ -1013,6 +1050,114 @@ def dual_decision(row, deepseek_key, deepseek_model, gemini_key, gemini_model,
 
 
 # ============================================================================
+# 模块3.6：紫苏叶评分卡（借鉴 serenity-skill 的加权打分，0~100 分）
+# ============================================================================
+
+# 8 个维度的权重（合计 100）
+SERENITY_WEIGHTS = {
+    "需求拐点": 15, "架构耦合": 10, "卡脖子严重度": 15, "供应商集中度": 12,
+    "扩产难度": 12, "证据质量": 15, "估值偏离": 11, "催化时机": 10,
+}
+# 4 项风险扣分项（每项 0~5 分，扣分系数 ×2）
+SERENITY_PENALTIES = ["增发摊薄", "公司治理", "炒作过热", "财务质量"]
+PENALTY_FACTOR = 2.0
+
+
+def _rating_0_5(v):
+    """把 LLM 给的评分安全转成 0~5 的浮点；非法/缺失按 0 处理（容错，不崩）。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if x < 0:
+        return 0.0
+    if x > 5:
+        return 5.0
+    return x
+
+
+def serenity_score(factors, penalties=None):
+    """
+    紫苏叶评分卡：8 维度各 0~5 分按权重折算求和，再减去风险扣分（每分 ×2），clamp 到 0~100。
+    缺失项按 0 分容错。返回 (score_int, detail_dict)。
+    detail_dict 含各维度得分、原始分、扣分与档位，供 UI 折叠区展示明细。
+    """
+    factors = factors or {}
+    penalties = penalties or {}
+    detail = {"维度": {}, "扣分": {}}
+    raw_total = 0.0
+    for dim, weight in SERENITY_WEIGHTS.items():
+        r = _rating_0_5(factors.get(dim))
+        pts = round(r / 5.0 * weight, 1)
+        raw_total += pts
+        detail["维度"][dim] = {"原始分(0-5)": r, "权重": weight, "得分": pts}
+
+    penalty_total = 0.0
+    for p in SERENITY_PENALTIES:
+        r = _rating_0_5(penalties.get(p))
+        deduct = round(r * PENALTY_FACTOR, 1)
+        penalty_total += deduct
+        if r > 0:
+            detail["扣分"][p] = {"风险分(0-5)": r, "扣分": deduct}
+
+    score = raw_total - penalty_total
+    score = max(0, min(100, int(round(score))))
+    detail["原始合计"] = round(raw_total, 1)
+    detail["扣分合计"] = round(penalty_total, 1)
+    detail["最终评分"] = score
+    detail["档位"] = serenity_grade(score)
+    return score, detail
+
+
+def serenity_grade(score):
+    """把 0~100 评分翻译成大白话档位。score 为 None 时返回未评分。"""
+    if score is None:
+        return "未评分"
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "未评分"
+    if s >= 85:
+        return "顶级优先"
+    if s >= 70:
+        return "高优先"
+    if s >= 55:
+        return "值得跟踪"
+    return "早期/低优先"
+
+
+def _avg_factor_dicts(*dicts):
+    """把多个 {维度:分} 字典按维度求平均（用于双AI评分合并）。空输入返回 {}。"""
+    valid = [d for d in dicts if isinstance(d, dict) and d]
+    if not valid:
+        return {}
+    keys = set()
+    for d in valid:
+        keys.update(d.keys())
+    out = {}
+    for k in keys:
+        vals = [_rating_0_5(d.get(k)) for d in valid if k in d]
+        if vals:
+            out[k] = sum(vals) / len(vals)
+    return out
+
+
+def compute_and_save_score(code, factors, penalties=None):
+    """算出紫苏叶评分并写库；factors 为空则不写。返回 (score, detail) 或 (None, None)。"""
+    if not factors:
+        return None, None
+    score, detail = serenity_score(factors, penalties)
+    try:
+        update_fields(code, {
+            "serenity_score": score,
+            "score_detail": json.dumps(detail, ensure_ascii=False),
+        })
+    except Exception:
+        pass
+    return score, detail
+
+
+# ============================================================================
 # 模块4：终极买卖决策引擎
 # ============================================================================
 
@@ -1075,12 +1220,21 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
                 if high_risk:
                     return "只看不动观望", "是符合紫苏叶标准的好公司，技术上也站上了均线，但【现在是高位，不建议追高买入】：" + "；".join(risks) + "。建议等股价回调到均线附近、获利盘消化后再考虑。"
                 davis = is_davis_double(row, npr_threshold, pe_pct_threshold)
-                if single_peak or davis:
+                # 卡位优先级：紫苏叶评分≥70（卡得很死的上游环节）也作为强烈买入的加分触发
+                sc = row.get("serenity_score")
+                strong_score = False
+                try:
+                    strong_score = sc is not None and float(sc) >= 70
+                except (TypeError, ValueError):
+                    strong_score = False
+                if single_peak or davis or strong_score:
                     why = []
                     if single_peak:
                         why.append("筹码处于低位单峰密集（成本集中、抛压小）")
                     if davis:
                         why.append("业绩大涨且估值偏低（戴维斯双击）")
+                    if strong_score:
+                        why.append(f"产业链卡位极硬（紫苏叶评分 {int(float(sc))} 分，{serenity_grade(sc)}）")
                     return "强烈买入", "符合紫苏叶好公司，且股价站上均线，又叠加" + "、".join(why) + "，是难得的好买点，可分批建仓。"
                 return "分批建仓买入", f"这是符合紫苏叶标准的好公司，股价（{close}）已站上20日和30日均价线，进入右侧上涨，可分批建仓买入。"
         elif close < ma30:
@@ -1139,6 +1293,15 @@ def render_signal_card(row, signal_key, reason):
     code = row.get("code") or ""
     hold_tag = "（已持仓）" if row.get("is_holding") else "（未持仓）"
     override_tag = " 👑人类强制收编" if row.get("is_override") else ""
+    # 紫苏叶评分徽章（卡位有多硬），无评分时给提示
+    _sc = row.get("serenity_score")
+    if _sc is not None:
+        score_badge = (f'<span style="background:rgba(255,255,255,0.25);border-radius:8px;'
+                       f'padding:2px 10px;font-size:15px;font-weight:700;margin-left:8px;">'
+                       f'🌿 紫苏叶评分 {int(float(_sc))}/100 · {serenity_grade(_sc)}</span>')
+    else:
+        score_badge = ('<span style="background:rgba(255,255,255,0.18);border-radius:8px;'
+                       'padding:2px 10px;font-size:14px;margin-left:8px;">🌿 未评分（重新研判可生成）</span>')
     st.markdown(
         f"""
         <div style="background:{style['color']};color:{style['text']};
@@ -1146,6 +1309,7 @@ def render_signal_card(row, signal_key, reason):
           <div class="perilla-card-title" style="font-size:22px;font-weight:800;">
             {style['emoji']} {name} {code} {hold_tag}{override_tag} —— {signal_key}
           </div>
+          <div style="margin-top:6px;">{score_badge}</div>
           <div class="perilla-card-reason" style="font-size:16px;margin-top:8px;line-height:1.6;">{reason}</div>
         </div>
         """,
@@ -1403,11 +1567,15 @@ def main():
                 row = dict(r)
                 sig, reason = decide(row, npr_threshold, pe_pct_threshold)
                 cards.append((order.get(sig, 9), row, sig, reason))
-            for _, row, sig, reason in sorted(cards, key=lambda x: x[0]):
+            # 同一信号档内，紫苏叶评分高（卡位更硬）的票排在前面
+            for _, row, sig, reason in sorted(cards, key=lambda x: (x[0], -(x[1].get("serenity_score") or 0))):
                 render_signal_card(row, sig, reason)
                 with st.expander("查看这只股的详细数据"):
+                    _sc = row.get("serenity_score")
                     st.write({
                         "纳入方式": "👑 人类强制收编（无视AI拒绝）" if row.get("is_override") else "AI 守门员通过",
+                        "🌿紫苏叶评分": (f"{int(float(_sc))}/100（{serenity_grade(_sc)}）"
+                                      if _sc is not None else "未评分（重新研判即可生成）"),
                         "最新收盘价": fmt(row.get("close")),
                         "10日均价线": fmt(row.get("ma10")),
                         "20日均价线": fmt(row.get("ma20")),
@@ -1429,6 +1597,26 @@ def main():
                     })
                     if row.get("analysis"):
                         st.markdown(f"**AI 选股理由：** {row.get('analysis')}")
+                    # 紫苏叶评分分项明细（如果有）
+                    _detail_raw = row.get("score_detail")
+                    if _detail_raw:
+                        try:
+                            _detail = json.loads(_detail_raw)
+                            _dims = _detail.get("维度", {})
+                            if _dims:
+                                st.caption("🌿 紫苏叶评分分项（满分如括号，原始分0~5）：")
+                                _tbl = pd.DataFrame([
+                                    {"维度": k, "原始分(0-5)": v.get("原始分(0-5)"),
+                                     "权重": v.get("权重"), "得分": v.get("得分")}
+                                    for k, v in _dims.items()
+                                ])
+                                st.dataframe(_tbl, hide_index=True, use_container_width=True)
+                                _ded = _detail.get("扣分", {})
+                                if _ded:
+                                    st.caption("风险扣分：" + "；".join(
+                                        f"{k} -{v.get('扣分')}" for k, v in _ded.items()))
+                        except Exception:
+                            pass
 
                 # ===== 🤝 双AI复核：让 DeepSeek + Gemini 一起判断买卖 =====
                 with st.expander("🤝 让两个AI（DeepSeek + Gemini）一起复核买卖"):
@@ -1528,10 +1716,14 @@ def main():
                         if not code:
                             st.warning("我已记下结论，但没能确定股票代码。请直接补一句代码（如 002472），我就入库。")
                         else:
-                            full_analysis = (f"【紫苏叶锚点：{anchor}】{analysis}"
-                                             if anchor else analysis)
+                            layer = data.get("chain_layer") or ""
+                            full_analysis = (f"【紫苏叶锚点：{anchor}】" + (f"【{layer}】" if layer else "") + analysis
+                                             if (anchor or layer) else analysis)
                             upsert_stock(code, name or code, True, full_analysis)
-                            st.success(f"✅ 已按『{anchor or '该逻辑'}』把 {name}({code}) 入池！"
+                            # 算紫苏叶评分并写库（AI 漏给 factors 则不评分，不报错）
+                            sc, _ = compute_and_save_score(code, data.get("factors"), data.get("penalties"))
+                            score_tip = (f" 紫苏叶评分 {sc}/100（{serenity_grade(sc)}）。" if sc is not None else "")
+                            st.success(f"✅ 已按『{anchor or '该逻辑'}』把 {name}({code}) 入池！{score_tip}"
                                        "下一步：左侧『🔄 一键刷新全池数据』拉行情，再到『🖼️ 上传筹码图』补筹码。")
 
         # ===== 🤝 双AI选股快速把关：DeepSeek + Gemini 各自独立研判是否紫苏叶 =====
@@ -1560,6 +1752,8 @@ def main():
                         st.markdown("结论：**" + ("✅ 是紫苏叶" if ds.get("is_perilla") else "❌ 不算紫苏叶") + "**")
                         if ds.get("anchor"):
                             st.caption(f"锚点：{ds.get('anchor')}")
+                        if ds.get("chain_layer"):
+                            st.caption(f"卡位：{ds.get('chain_layer')}")
                         st.caption(ds.get("reason", ""))
                     else:
                         st.error(ds_err or "未获取到结果")
@@ -1569,6 +1763,8 @@ def main():
                         st.markdown("结论：**" + ("✅ 是紫苏叶" if gm.get("is_perilla") else "❌ 不算紫苏叶") + "**")
                         if gm.get("anchor"):
                             st.caption(f"锚点：{gm.get('anchor')}")
+                        if gm.get("chain_layer"):
+                            st.caption(f"卡位：{gm.get('chain_layer')}")
                         st.caption(gm.get("reason", ""))
                     else:
                         st.error(gm_err or "未获取到结果")
@@ -1585,7 +1781,12 @@ def main():
                     if code_guess and st.button(f"➕ 两个AI都认可，入池 {sname}", key="dual_sel_add"):
                         full = f"【紫苏叶锚点：{anchor}】DeepSeek与Gemini双模型一致认可。" if anchor else "DeepSeek与Gemini双模型一致认可。"
                         upsert_stock(code_guess, sname, True, full)
-                        st.success(f"✅ 已入池 {sname}({code_guess})！请到左侧『🔄 一键刷新全池数据』拉行情。")
+                        # 双AI评分取两者平均后算分写库
+                        avg_f = _avg_factor_dicts(ds.get("factors"), gm.get("factors"))
+                        avg_p = _avg_factor_dicts(ds.get("penalties"), gm.get("penalties"))
+                        sc_g, _ = compute_and_save_score(code_guess, avg_f, avg_p)
+                        score_tip = (f" 紫苏叶评分 {sc_g}/100（{serenity_grade(sc_g)}）。" if sc_g is not None else "")
+                        st.success(f"✅ 已入池 {sname}({code_guess})！{score_tip}请到左侧『🔄 一键刷新全池数据』拉行情。")
                     elif not code_guess:
                         st.info("两个AI都认可。请在上面输入框补上6位代码（如 002472）再研判一次，即可一键入池。")
 
@@ -1623,10 +1824,15 @@ def main():
                 with st.spinner("重新研判中…"):
                     ok, data, err = call_deepseek_gatekeeper(deepseek_key, deepseek_model, f"{nm} {sel}")
                 if ok:
+                    layer = data.get("chain_layer") or ""
+                    analysis_re = data.get("analysis") or ""
+                    full_re = (f"【{layer}】{analysis_re}" if layer else analysis_re)
                     upsert_stock(sel, data.get("name") or nm,
-                                 bool(data.get("is_perilla_leaf")), data.get("analysis") or "")
-                    st.success("已更新研判结果。")
-                    st.markdown(f"**最新理由：** {data.get('analysis')}")
+                                 bool(data.get("is_perilla_leaf")), full_re)
+                    sc_re, _ = compute_and_save_score(sel, data.get("factors"), data.get("penalties"))
+                    score_tip = (f"（🌿 紫苏叶评分 {sc_re}/100 · {serenity_grade(sc_re)}）" if sc_re is not None else "")
+                    st.success(f"已更新研判结果。{score_tip}")
+                    st.markdown(f"**最新理由：** {analysis_re}")
                 else:
                     st.error(err)
 
@@ -1877,7 +2083,7 @@ def main():
 
             rename = {
                 "code": "代码", "name": "名称", "is_holding": "已持仓",
-                "is_override": "👑强制收编",
+                "is_override": "👑强制收编", "serenity_score": "🌿紫苏叶评分",
                 "npr_growth": "净利润同比增长%", "eps": "每股收益EPS", "pe": "PE", "pe_percentile": "PE近3年分位%",
                 "close": "收盘价", "ma10": "MA10(10日均价)", "ma20": "MA20(20日均价)",
                 "ma30": "MA30(30日均价)", "lhb_flag": "上龙虎榜", "lhb_net": "龙虎榜净买入(万)",
@@ -1888,7 +2094,7 @@ def main():
                 "chip_high_diverge": "高位发散", "chip_confidence": "视觉置信度",
                 "has_chip": "已有筹码分析", "updated_at": "更新时间",
             }
-            cols = ["code", "name", "操作建议", "建议原因", "is_override", "is_holding", "close",
+            cols = ["code", "name", "操作建议", "建议原因", "serenity_score", "is_override", "is_holding", "close",
                     "ma10", "ma20", "ma30", "npr_growth", "eps", "pe", "pe_percentile",
                     "avg_cost", "profit_ratio", "lhb_flag", "lhb_net",
                     "main_net_today", "main_net_5d", "margin_chg",
