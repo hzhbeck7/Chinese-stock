@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m py_compile app.py)"
+      "Bash(python -m py_compile app.py)",
+      "Bash(python -c \"import akshare, sys; print\\('akshare', akshare.__version__\\); print\\('python', sys.version\\)\")",
+      "Bash(python _diag_akshare.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag_akshare.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python -c \"import akshare as ak; fns=[f for f in dir\\(ak\\) if 'indicator' in f.lower\\(\\) or 'a_indicator' in f.lower\\(\\) or \\('pe' in f.lower\\(\\)\\)]; print\\('\\\\n'.join\\(fns\\)\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python -c \"import akshare as ak; fns=[f for f in dir\\(ak\\) if f.endswith\\('_lg'\\) or 'value' in f.lower\\(\\) or 'valuation' in f.lower\\(\\) or 'gpr' in f.lower\\(\\)]; print\\('\\\\n'.join\\(fns\\)\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag2.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag3.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python _diag4.py)"
     ]
   }
 }

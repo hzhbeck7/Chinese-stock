@@ -498,40 +498,87 @@ def _get_akshare():
         return None
 
 
+def _prefixed_symbol(code):
+    """6位代码 → 带市场前缀的代码（新浪/腾讯接口需要，如 sz002472 / sh600519 / bj830799）。"""
+    c = str(code).zfill(6)
+    if c[0] == "6":
+        return "sh" + c           # 沪市主板/科创板(688)
+    if c[0] in ("0", "3"):
+        return "sz" + c           # 深市主板/创业板(300)
+    if c[0] in ("4", "8"):
+        return "bj" + c           # 北交所
+    if c[0] == "9":
+        return "sh" + c           # 沪市B股
+    return "sz" + c
+
+
+def _ma_from_close(df, date_col, close_col):
+    """从含『日期+收盘』的日线表计算 close 与 MA10/20/30；数据不足返回 None。"""
+    if df is None or len(df) == 0 or close_col not in df.columns:
+        return None
+    d = df.copy()
+    if date_col in d.columns:
+        d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+        d = d.dropna(subset=[date_col]).sort_values(date_col)
+    close = pd.to_numeric(d[close_col], errors="coerce").dropna()
+    if close.empty:
+        return None
+
+    def ma(n):
+        return round(float(close.rolling(n).mean().iloc[-1]), 2) if len(close) >= n else None
+
+    return {"close": round(float(close.iloc[-1]), 2),
+            "ma10": ma(10), "ma20": ma(20), "ma30": ma(30)}
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_price_ma(code):
     """
     拉取日线行情，计算最新收盘价与 MA10/MA20/MA30。
-    成功返回 dict；失败则抛出异常（注意：Streamlit 不会缓存抛异常的结果，
-    因此下次点『刷新』会自动重试，而不会被旧的失败结果卡住）。
+    多数据源依次尝试：新浪 → 腾讯 → 东方财富。
+    （东方财富的行情/快照服务器对部分网络、云服务器 IP 会拒绝连接，故优先用新浪/腾讯。）
+    成功返回 dict；全部失败则抛出异常（Streamlit 不缓存异常，下次刷新会自动重试）。
     """
     ak = _get_akshare()
     if ak is None:
         raise RuntimeError("akshare 未安装")
-
-    end = datetime.date.today().strftime("%Y%m%d")
-    start = (datetime.date.today() - datetime.timedelta(days=200)).strftime("%Y%m%d")
+    sym = _prefixed_symbol(code)
     last_err = "未知原因"
-    # 网络可能抽风，最多重试 3 次
-    for _ in range(3):
-        try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                    start_date=start, end_date=end, adjust="qfq")
-            if df is None or df.empty:
-                last_err = "接口返回空数据"
-                continue
-            df = df.sort_values("日期")
-            close = df["收盘"].astype(float)
-            return {
-                "close": round(float(close.iloc[-1]), 2),
-                "ma10": round(float(close.rolling(10).mean().iloc[-1]), 2) if len(close) >= 10 else None,
-                "ma20": round(float(close.rolling(20).mean().iloc[-1]), 2) if len(close) >= 20 else None,
-                "ma30": round(float(close.rolling(30).mean().iloc[-1]), 2) if len(close) >= 30 else None,
-            }
-        except Exception as e:
-            last_err = str(e)
-            continue
-    raise RuntimeError(f"行情数据获取失败：{last_err}")
+
+    # 源1：新浪（最稳、最快）
+    try:
+        df = ak.stock_zh_a_daily(symbol=sym, adjust="qfq")
+        r = _ma_from_close(df, "date", "close")
+        if r:
+            return r
+        last_err = "新浪返回空数据"
+    except Exception as e:
+        last_err = f"新浪源失败：{e}"
+
+    # 源2：腾讯
+    try:
+        df = ak.stock_zh_a_hist_tx(symbol=sym, adjust="qfq")
+        r = _ma_from_close(df, "date", "close")
+        if r:
+            return r
+        last_err = "腾讯返回空数据"
+    except Exception as e:
+        last_err = f"腾讯源失败：{e}"
+
+    # 源3：东方财富（最后兜底，部分网络下会连接被拒）
+    try:
+        end = datetime.date.today().strftime("%Y%m%d")
+        start = (datetime.date.today() - datetime.timedelta(days=400)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(symbol=str(code).zfill(6), period="daily",
+                                start_date=start, end_date=end, adjust="qfq")
+        r = _ma_from_close(df, "日期", "收盘")
+        if r:
+            return r
+        last_err = "东财返回空数据"
+    except Exception as e:
+        last_err = f"东财源失败：{e}"
+
+    raise RuntimeError(f"行情数据获取失败（已尝试新浪/腾讯/东财）：{last_err}")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -586,51 +633,70 @@ def fetch_npr_growth(code):
     return None
 
 
+def _pe_pct_from_series(df, date_col, pe_col):
+    """从含『日期 + PE』的序列计算当前 PE 与近3年分位。返回 (pe, pct) 或 (None, None)。"""
+    try:
+        if df is None or len(df) == 0 or pe_col not in df.columns:
+            return None, None
+        d = df[[date_col, pe_col]].copy()
+        d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+        d[pe_col] = pd.to_numeric(d[pe_col], errors="coerce")
+        d = d.dropna().sort_values(date_col)
+        if d.empty:
+            return None, None
+        cutoff = pd.Timestamp(datetime.date.today() - datetime.timedelta(days=365 * 3))
+        recent = d[d[date_col] >= cutoff]
+        if recent.empty:
+            recent = d
+        s = recent[pe_col].astype(float)
+        cur_pe = float(s.iloc[-1])
+        pct = round(float((s <= cur_pe).mean() * 100), 1)  # 当前 PE 在近3年中的百分位
+        return round(cur_pe, 2), pct
+    except Exception:
+        return None, None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pe_percentile(code):
     """
-    拉取历史 PE 序列，计算当前 PE 及其近3年分位（%）。
-    返回 (pe, pe_percentile) ；失败返回 (None, None)。
+    拉取历史 PE(TTM) 序列，计算当前 PE 及其近3年分位（%）。
+    数据源：东方财富个股估值 stock_value_em（主）→ 百度股市通 stock_zh_valuation_baidu（备）。
+    （注：旧版用的 stock_a_indicator_lg 在新版 akshare 已被移除，这是之前 PE 总取不到的主因。）
+    返回 (pe, pe_percentile)；失败返回 (None, None)。
     """
     ak = _get_akshare()
     if ak is None:
         return None, None
-    df = None
-    for _ in range(2):  # legulegu 源不稳，重试 2 次
-        try:
-            df = ak.stock_a_indicator_lg(symbol=code)  # legulegu 历史估值
-            if df is not None and not df.empty:
-                break
-        except Exception:
-            df = None
-            continue
+    c = str(code).zfill(6)
+
+    # 源1：东方财富个股估值（含 PE(TTM) 日序列，可同时算现值与分位）
     try:
-        if df is None or df.empty:
-            return None, None
-        # 找到 PE 列与日期列
-        pe_col = None
-        for c in df.columns:
-            if str(c).lower() in ("pe", "pe_ttm") or "市盈率" in str(c):
-                pe_col = c
-                break
-        if pe_col is None:
-            return None, None
-        date_col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-        df = df[[date_col, pe_col]].dropna()
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna().sort_values(date_col)
-        # 近3年
-        cutoff = pd.Timestamp(datetime.date.today() - datetime.timedelta(days=365 * 3))
-        recent = df[df[date_col] >= cutoff]
-        if recent.empty:
-            recent = df
-        pe_series = recent[pe_col].astype(float)
-        cur_pe = float(pe_series.iloc[-1])
-        # 分位：当前 PE 在历史序列中的百分位排名
-        pct = round(float((pe_series <= cur_pe).mean() * 100), 1)
-        return round(cur_pe, 2), pct
+        df = ak.stock_value_em(symbol=c)
+        if df is not None and not df.empty:
+            date_col = "数据日期" if "数据日期" in df.columns else df.columns[0]
+            pe_col = None
+            for cand in ("PE(TTM)", "PE（TTM）", "市盈率(TTM)"):
+                if cand in df.columns:
+                    pe_col = cand
+                    break
+            if pe_col:
+                r = _pe_pct_from_series(df, date_col, pe_col)
+                if r != (None, None):
+                    return r
     except Exception:
-        return None, None
+        pass
+
+    # 源2：百度股市通 市盈率(TTM)
+    try:
+        df = ak.stock_zh_valuation_baidu(symbol=c, indicator="市盈率(TTM)", period="近五年")
+        if df is not None and not df.empty and "value" in df.columns:
+            r = _pe_pct_from_series(df, "date", "value")
+            if r != (None, None):
+                return r
+    except Exception:
+        pass
+
+    return None, None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
