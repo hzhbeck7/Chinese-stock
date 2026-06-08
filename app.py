@@ -130,7 +130,8 @@ def init_db():
                      ("main_net_today", "REAL"), ("main_net_5d", "REAL"), ("margin_chg", "REAL"),
                      ("is_override", "INTEGER DEFAULT 0"), ("eps", "REAL"),
                      ("serenity_score", "REAL"), ("score_detail", "TEXT"),
-                     ("gdhs", "REAL"), ("gdhs_chg", "REAL")]:
+                     ("gdhs", "REAL"), ("gdhs_chg", "REAL"),
+                     ("turnover", "REAL"), ("vol_ratio", "REAL")]:
         try:
             cur.execute(f"ALTER TABLE stock_pool ADD COLUMN {col} {typ}")
         except Exception:
@@ -972,6 +973,49 @@ def fetch_gdhs(code):
         return None, None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_turnover_vol(code):
+    """
+    【换手率 & 量比】仅用东财日线接口（stock_zh_a_hist）拉取。
+    返回 (换手率%, 量比)；量比 = 最新成交量 / 近5日平均成交量（今日不含）。
+    取不到任意项则对应值为 None；全失败返回 (None, None)。
+    """
+    ak = _get_akshare()
+    if ak is None:
+        return None, None
+    try:
+        end = datetime.date.today().strftime("%Y%m%d")
+        start = (datetime.date.today() - datetime.timedelta(days=60)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(symbol=str(code).zfill(6), period="daily",
+                                start_date=start, end_date=end, adjust="qfq")
+        if df is None or len(df) < 6:
+            return None, None
+        if "日期" in df.columns:
+            df = df.sort_values("日期")
+        # 换手率
+        turnover = None
+        if "换手率" in df.columns:
+            try:
+                turnover = round(float(df["换手率"].iloc[-1]), 2)
+            except Exception:
+                pass
+        # 量比 = 最新成交量 / 前5日均量
+        vol_ratio = None
+        if "成交量" in df.columns:
+            try:
+                vol = pd.to_numeric(df["成交量"], errors="coerce").dropna()
+                if len(vol) >= 6:
+                    today_vol = float(vol.iloc[-1])
+                    avg5 = float(vol.iloc[-6:-1].mean())
+                    if avg5 > 0:
+                        vol_ratio = round(today_vol / avg5, 2)
+            except Exception:
+                pass
+        return turnover, vol_ratio
+    except Exception:
+        return None, None
+
+
 def _to_float_pct(v):
     """把可能带 % 或文字的值转成 float；不可转返回 None。"""
     if v is None:
@@ -1027,6 +1071,13 @@ def refresh_one_stock(code):
         fields["gdhs"] = gdhs
     if gdhs_chg is not None:
         fields["gdhs_chg"] = gdhs_chg
+
+    # 换手率 & 量比（量价信号基础数据；仅东财源，取不到不动原值）
+    turnover, vol_ratio = fetch_turnover_vol(code)
+    if turnover is not None:
+        fields["turnover"] = turnover
+    if vol_ratio is not None:
+        fields["vol_ratio"] = vol_ratio
 
     # 自动筹码（免上传图）：仅当该股【没有被人工修正过】时，才用自动估算覆盖筹码字段。
     # 人工/视觉看图的结论更准，必须优先保留（chip_manual=1 时跳过自动覆盖）。
@@ -1377,6 +1428,29 @@ def buyability_score(close, ma20, ma30):
     return 30, "🔴 暂别追", "还在30日均价线下方，处于左侧寻底，先观望，等它站稳均线再说。"
 
 
+def turnover_level(turnover):
+    """
+    【换手率情绪温度计】把换手率（%）映射到情绪档位。
+    返回 (tag大白话, color色值, is_hot过热布尔, is_cold过冷布尔)。
+    分级参考：<0.5%极冷 / 0.5-2%正常 / 2-5%活跃 / 5-10%偏热 / >10%极热。
+    """
+    if turnover is None:
+        return "未知", "#888888", False, False
+    try:
+        t = float(turnover)
+    except (TypeError, ValueError):
+        return "未知", "#888888", False, False
+    if t < 0.5:
+        return "🔵 极冷场", "#4a90d9", False, True
+    if t < 2.0:
+        return "⚪ 正常换手", "#888888", False, False
+    if t < 5.0:
+        return "🟡 活跃换手", "#e6b800", False, False
+    if t < 10.0:
+        return "🟠 偏热注意", "#e67e22", True, False
+    return "🔴 极热警惕", "#c0392b", True, False
+
+
 def eval_buyability_for_sectors(sectors):
     """为挖掘结果里每只股票评估『今日可买入度』（联网取价算分），结果写回 stk['_buy_*']。单只失败不影响其他。"""
     for sec in sectors or []:
@@ -1496,7 +1570,14 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
                     strong_score = sc is not None and float(sc) >= 70
                 except (TypeError, ValueError):
                     strong_score = False
-                if single_peak or davis or strong_score:
+                # 量价确认：量比>2且收盘站上均线（放量突破，买盘积极）
+                vr = None
+                try:
+                    vr = float(row.get("vol_ratio")) if row.get("vol_ratio") is not None else None
+                except (TypeError, ValueError):
+                    vr = None
+                vol_breakthrough = bool(vr is not None and vr > 2.0)
+                if single_peak or davis or strong_score or vol_breakthrough:
                     why = []
                     if single_peak:
                         why.append("筹码处于低位单峰密集（成本集中、抛压小）")
@@ -1508,6 +1589,8 @@ def decide(row, npr_threshold=20.0, pe_pct_threshold=50.0):
                         except (TypeError, ValueError):
                             _sc_str = "高分"
                         why.append(f"产业链卡位极硬（紫苏叶评分 {_sc_str}，{serenity_grade(sc)}）")
+                    if vol_breakthrough:
+                        why.append(f"放量突破均线（量比{vr}倍），大单积极买入")
                     return "强烈买入", "符合紫苏叶好公司，且股价站上均线，又叠加" + "、".join(why) + "，是难得的好买点，可分批建仓。" + chip_hint
                 return "分批建仓买入", f"这是符合紫苏叶标准的好公司，股价（{close}）已站上20日和30日均价线，进入右侧上涨，可分批建仓买入。{chip_hint}"
         elif close < ma30:
@@ -1616,6 +1699,26 @@ def _bull_bear_signals(row):
         elif chg > 0:
             bears.append(f"股东户数较上期增加 {chg}%（筹码在分散，需留意）")
 
+    # —— 量价信号（换手率情绪 + 量比）——
+    vr = _f(row.get("vol_ratio"))
+    to = _f(row.get("turnover"))
+    is_holding = bool(row.get("is_holding"))
+    lv_tag, _, is_hot, is_cold = turnover_level(to)
+    # 放量突破：量比>2且收盘高于20日线
+    if vr is not None and vr > 2.0 and c is not None and m20 is not None and c > m20:
+        bulls.append(f"放量突破（量比{vr}倍），大单积极买入，动能较强")
+    # 缩量回踩：量比<0.7且价格贴近MA20（误差2%以内）
+    if vr is not None and vr < 0.7 and c is not None and m20 is not None and abs(c - m20) / m20 < 0.02:
+        bulls.append(f"缩量回踩20日均线（量比{vr}倍），抛压小、蓄势待发，是不错的入场机会")
+    # 放量下跌警告：量比>2且收盘低于均线
+    if vr is not None and vr > 2.0 and c is not None and m20 is not None and c < m20:
+        bears.append(f"放量下跌（量比{vr}倍），卖盘沉重，需警惕持续下行")
+    # 换手率情绪
+    if to is not None and is_hot:
+        bears.append(f"换手率过热（{to}%，{lv_tag}），市场过于亢奋，顶部风险加大")
+    if to is not None and is_cold and not is_holding:
+        bulls.append(f"换手极冷（{to}%，{lv_tag}），低温蓄势往往是底部信号之一")
+
     # —— 高位追高风险（复用现成清单）——
     for r in _high_position_risks(row, close):
         bears.append(r)
@@ -1624,23 +1727,107 @@ def _bull_bear_signals(row):
 
 
 def render_bull_bear(row):
-    """在卡片下方渲染『做多理由 vs 做空理由』两列对比（纯展示，不改决策）。"""
+    """在卡片下方渲染『做多理由 vs 做空理由』双栏对比（深色 HTML 卡片样式，参考图1）。"""
     bulls, bears = _bull_bear_signals(row)
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**🟢 做多理由（看涨）**")
-        if bulls:
-            for b in bulls:
-                st.markdown(f"- {b}")
+
+    def _items_html(items, empty_txt):
+        if not items:
+            return f'<div style="color:#888;font-size:13px;padding:4px 0;">{empty_txt}</div>'
+        rows_html = "".join(
+            f'<div style="margin:5px 0;font-size:14px;line-height:1.5;">'
+            f'<span style="margin-right:6px;">→</span>{item}</div>'
+            for item in items
+        )
+        return rows_html
+
+    bull_html = _items_html(bulls, "暂无明显看涨信号")
+    bear_html = _items_html(bears, "暂无明显看跌信号")
+
+    st.markdown(
+        f"""
+        <div style="display:flex;gap:12px;margin:10px 0 4px 0;">
+          <div style="flex:1;background:#1a2e1a;border-left:4px solid #4caf50;
+                      border-radius:10px;padding:14px 16px;min-height:80px;">
+            <div style="color:#6fcf7f;font-weight:700;font-size:15px;margin-bottom:10px;">
+              📈 多方逻辑
+            </div>
+            <div style="color:#c8e6c9;">{bull_html}</div>
+          </div>
+          <div style="flex:1;background:#2e1a1a;border-left:4px solid #e05252;
+                      border-radius:10px;padding:14px 16px;min-height:80px;">
+            <div style="color:#e07070;font-weight:700;font-size:15px;margin-bottom:10px;">
+              📉 空方风险
+            </div>
+            <div style="color:#ffcdd2;">{bear_html}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_score_bars(score_detail_json):
+    """
+    【紫苏叶评分维度进度条】把 score_detail JSON 里每个维度渲染成横向进度条（参考图2风格）。
+    rating ≥4 → 红色；≥3 → 橙色；其他 → 灰色。容错：解析失败直接 return。
+    """
+    if not score_detail_json:
+        return
+    try:
+        detail = json.loads(score_detail_json)
+    except Exception:
+        return
+    dims = detail.get("维度", {})
+    if not dims:
+        return
+
+    bars_html = '<div style="margin:10px 0;">'
+    bars_html += '<div style="color:#aaa;font-size:13px;margin-bottom:8px;">🌿 紫苏叶评分分项（0-5分）</div>'
+    for name, info in dims.items():
+        try:
+            rating = float(info.get("原始分(0-5)") or info.get("rating") or 0)
+        except (TypeError, ValueError):
+            rating = 0
+        pct = min(100, int(rating / 5 * 100))
+        if rating >= 4:
+            color = "#e05252"
+        elif rating >= 3:
+            color = "#e6823c"
+        elif rating >= 2:
+            color = "#d4ac0d"
         else:
-            st.caption("暂无明显看涨信号")
-    with col_b:
-        st.markdown("**🔴 做空理由（看跌/风险）**")
-        if bears:
-            for b in bears:
-                st.markdown(f"- {b}")
-        else:
-            st.caption("暂无明显看跌信号")
+            color = "#555555"
+        bars_html += (
+            f'<div style="display:flex;align-items:center;margin:5px 0;">'
+            f'<span style="display:inline-block;width:110px;color:#bbb;font-size:13px;'
+            f'flex-shrink:0;">{name}</span>'
+            f'<div style="flex:1;height:8px;background:#2a2a2a;border-radius:4px;'
+            f'margin:0 10px;max-width:200px;">'
+            f'<div style="width:{pct}%;height:100%;background:{color};border-radius:4px;"></div>'
+            f'</div>'
+            f'<span style="color:#bbb;font-size:12px;min-width:28px;">{rating:.0f}/5</span>'
+            f'</div>'
+        )
+
+    # 风险扣分项
+    deductions = detail.get("扣分", {})
+    if deductions:
+        ded_items = []
+        for k, v in deductions.items():
+            try:
+                d = v.get("扣分") or v.get("deduction") or 0
+                if d:
+                    ded_items.append(f"{k} -{d}")
+            except Exception:
+                pass
+        if ded_items:
+            bars_html += (
+                f'<div style="color:#e07070;font-size:12px;margin-top:8px;">'
+                f'⚠ 风险扣分：{"；".join(ded_items)}</div>'
+            )
+
+    bars_html += '</div>'
+    st.markdown(bars_html, unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -1968,6 +2155,10 @@ def main():
                                       if (row.get('gdhs_chg') is not None and float(row.get('gdhs_chg')) > 0)
                                       else "基本持平")) + "）")
                             if row.get("gdhs_chg") is not None else MISSING),
+                        "换手率": (f"{row.get('turnover')}%  {turnover_level(row.get('turnover'))[0]}"
+                                   if row.get("turnover") is not None else MISSING),
+                        "量比（今日/5日均量）": (f"{row.get('vol_ratio')} 倍"
+                                                  if row.get("vol_ratio") is not None else MISSING),
                         "筹码-低位单峰密集": _chip_text(row, "chip_single_peak"),
                         "筹码-站上平均成本线": _chip_text(row, "chip_above_avg"),
                         "筹码-高位发散": _chip_text(row, "chip_high_diverge"),
@@ -1976,26 +2167,8 @@ def main():
                     })
                     if row.get("analysis"):
                         st.markdown(f"**AI 选股理由：** {row.get('analysis')}")
-                    # 紫苏叶评分分项明细（如果有）
-                    _detail_raw = row.get("score_detail")
-                    if _detail_raw:
-                        try:
-                            _detail = json.loads(_detail_raw)
-                            _dims = _detail.get("维度", {})
-                            if _dims:
-                                st.caption("🌿 紫苏叶评分分项（满分如括号，原始分0~5）：")
-                                _tbl = pd.DataFrame([
-                                    {"维度": k, "原始分(0-5)": v.get("原始分(0-5)"),
-                                     "权重": v.get("权重"), "得分": v.get("得分")}
-                                    for k, v in _dims.items()
-                                ])
-                                st.dataframe(_tbl, hide_index=True, use_container_width=True)
-                                _ded = _detail.get("扣分", {})
-                                if _ded:
-                                    st.caption("风险扣分：" + "；".join(
-                                        f"{k} -{v.get('扣分')}" for k, v in _ded.items()))
-                        except Exception:
-                            pass
+                    # 紫苏叶评分分项明细：横向进度条（参考图2风格）
+                    render_score_bars(row.get("score_detail"))
 
                 # ===== 🤝 双AI复核：让 DeepSeek + Gemini 一起判断买卖 =====
                 with st.expander("🤝 让两个AI（DeepSeek + Gemini）一起复核买卖"):
@@ -2543,6 +2716,7 @@ def main():
                 "main_net_today": "今日主力净流入(亿)", "main_net_5d": "近5日主力净流入(亿)",
                 "margin_chg": "融资余额变化%",
                 "gdhs": "股东户数", "gdhs_chg": "股东户数变化%",
+                "turnover": "换手率%", "vol_ratio": "量比",
                 "chip_single_peak": "低位单峰密集", "chip_above_avg": "站上成本线",
                 "chip_high_diverge": "高位发散", "chip_confidence": "视觉置信度",
                 "has_chip": "已有筹码分析", "updated_at": "更新时间",
@@ -2551,6 +2725,7 @@ def main():
                     "ma10", "ma20", "ma30", "npr_growth", "eps", "pe", "pe_percentile",
                     "avg_cost", "profit_ratio", "lhb_flag", "lhb_net",
                     "main_net_today", "main_net_5d", "margin_chg", "gdhs", "gdhs_chg",
+                    "turnover", "vol_ratio",
                     "chip_single_peak", "chip_above_avg", "chip_high_diverge",
                     "chip_confidence", "has_chip", "updated_at"]
             cols = [c for c in cols if c in show.columns or c in ("操作建议", "建议原因")]
