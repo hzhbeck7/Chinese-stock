@@ -1016,6 +1016,118 @@ def fetch_turnover_vol(code):
         return None, None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_recent_rally(code):
+    """
+    【近期涨幅】算该股近约 60 个交易日（~100 自然日）的累计涨幅%，用于『暴涨过滤·避免追高』。
+    返回 dict：{"gain_pct": 累计涨幅%或None, "why": 大白话说明}。
+    取不到时 gain_pct=None（按『不暴涨』处理，避免误杀），不抛异常。
+    """
+    ak = _get_akshare()
+    if ak is None:
+        return {"gain_pct": None, "why": "未安装行情库"}
+    try:
+        end = datetime.date.today().strftime("%Y%m%d")
+        start = (datetime.date.today() - datetime.timedelta(days=100)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(symbol=str(code).zfill(6), period="daily",
+                                start_date=start, end_date=end, adjust="qfq")
+        if df is None or len(df) < 20:
+            return {"gain_pct": None, "why": "历史数据不足"}
+        if "日期" in df.columns:
+            df = df.sort_values("日期")
+        closes = pd.to_numeric(df["收盘"], errors="coerce").dropna() if "收盘" in df.columns else None
+        if closes is None or len(closes) < 20:
+            return {"gain_pct": None, "why": "历史数据不足"}
+        first = float(closes.iloc[0])
+        last = float(closes.iloc[-1])
+        if first <= 0:
+            return {"gain_pct": None, "why": "数据异常"}
+        gain_pct = round((last - first) / first * 100, 1)
+        return {"gain_pct": gain_pct, "why": f"近2-3月累计涨幅 {gain_pct}%"}
+    except Exception:
+        return {"gain_pct": None, "why": "行情没拉到"}
+
+
+def _pick_col(df, candidates):
+    """从 DataFrame 里按候选名顺序找第一个存在的列名，找不到返回 None。"""
+    if df is None:
+        return None
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_hot_boards(top_n=3):
+    """
+    【热门板块】取当前涨幅最高的前 top_n 个概念板块（主源）/行业板块（备源）。
+    返回 [{"board": 板块名, "pct": 涨跌幅%}]；失败返回 []。
+    """
+    ak = _get_akshare()
+    if ak is None:
+        return []
+    for fn in ("stock_board_concept_name_em", "stock_board_industry_name_em"):
+        try:
+            func = getattr(ak, fn, None)
+            if func is None:
+                continue
+            df = func()
+            if df is None or df.empty:
+                continue
+            name_col = _pick_col(df, ["板块名称", "概念名称", "名称"])
+            pct_col = _pick_col(df, ["涨跌幅", "涨幅"])
+            if not name_col or not pct_col:
+                continue
+            tmp = df.copy()
+            tmp["_pct"] = pd.to_numeric(tmp[pct_col], errors="coerce")
+            tmp = tmp.dropna(subset=["_pct"]).sort_values("_pct", ascending=False)
+            out = []
+            for _, r in tmp.head(top_n).iterrows():
+                out.append({"board": str(r[name_col]), "pct": round(float(r["_pct"]), 2)})
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_board_cons(board):
+    """
+    【板块成分股】取某板块的成分股精简表（代码/名称/今日涨跌幅/换手率/最新价）。
+    主源概念成分，备源行业成分。返回 DataFrame（统一列名 code/name/pct/turnover/price）；失败返回 None。
+    """
+    ak = _get_akshare()
+    if ak is None or not board:
+        return None
+    for fn in ("stock_board_concept_cons_em", "stock_board_industry_cons_em"):
+        try:
+            func = getattr(ak, fn, None)
+            if func is None:
+                continue
+            df = func(symbol=str(board))
+            if df is None or df.empty:
+                continue
+            code_col = _pick_col(df, ["代码", "股票代码"])
+            name_col = _pick_col(df, ["名称", "股票名称"])
+            pct_col = _pick_col(df, ["涨跌幅", "涨幅"])
+            to_col = _pick_col(df, ["换手率"])
+            price_col = _pick_col(df, ["最新价", "现价", "收盘"])
+            if not code_col or not name_col:
+                continue
+            out = pd.DataFrame()
+            out["code"] = df[code_col].astype(str).str.zfill(6)
+            out["name"] = df[name_col].astype(str)
+            out["pct"] = pd.to_numeric(df[pct_col], errors="coerce") if pct_col else None
+            out["turnover"] = pd.to_numeric(df[to_col], errors="coerce") if to_col else None
+            out["price"] = pd.to_numeric(df[price_col], errors="coerce") if price_col else None
+            return out
+        except Exception:
+            continue
+    return None
+
+
 def _to_float_pct(v):
     """把可能带 % 或文字的值转成 float；不可转返回 None。"""
     if v is None:
@@ -1467,6 +1579,274 @@ def eval_buyability_for_sectors(sectors):
             except Exception:
                 stk["_buy_score"], stk["_buy_tag"], stk["_buy_why"] = None, "买点未知", "行情没拉到（可重试）"
     return sectors
+
+
+def _clamp_score(v):
+    """把分数夹到 0~100 的整数。"""
+    try:
+        return int(max(0, min(100, round(v))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def next_day_buy_score(stk, turnover, vol_ratio, rally, rally_threshold):
+    """
+    【紫苏叶当日精选·次日买入推荐度】对一只挖掘候选股按"当天股价 + 量价 + 涨幅"打分。
+    返回 (score:int 0~100, reasons:list[str], exclude:bool, exclude_reason:str)。
+    先判暴涨排除（涨幅超滑块阈值 或 高出30日线>30%），再综合打分。
+    """
+    close = stk.get("_close")
+    ma20 = stk.get("_ma20")
+    ma30 = stk.get("_ma30")
+    serenity = stk.get("_score")
+    gain_pct = (rally or {}).get("gain_pct")
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    c, m20, m30 = _f(close), _f(ma20), _f(ma30)
+
+    # —— 暴涨排除（先判，避免追高）——
+    ext30 = None
+    if c is not None and m30 is not None and m30 > 0:
+        ext30 = (c - m30) / m30 * 100
+    if gain_pct is not None and gain_pct > rally_threshold:
+        return 0, [], True, f"近2-3月已涨 {gain_pct}%（超过你设的 {rally_threshold}% 红线），追高风险大，先不推荐。"
+    if ext30 is not None and ext30 > 30:
+        return 0, [], True, f"股价已高出30日均价线 {round(ext30,1)}%（涨过头了），追高风险大，先不推荐。"
+
+    # —— 综合打分 ——
+    score = 0
+    if m20 is not None and c is not None and m30 is not None and c > m20 and c > m30:
+        score += 60   # 站上双线（右侧上涨）
+    elif c is not None and m30 is not None and c > m30:
+        score += 40   # 仅站上30日线
+    else:
+        score += 15   # 还在均线下
+
+    # 紫苏叶卡位加分（基本面好坏，最多 +20）
+    score += round((_f(serenity) or 0) / 100 * 20)
+
+    # 量价
+    vr = _f(vol_ratio)
+    if vr is not None and vr > 1.5 and c is not None and m20 is not None and c > m20:
+        score += 12   # 放量突破
+    elif vr is not None and 1.0 <= vr <= 1.5:
+        score += 6    # 温和放量
+    elif vr is not None and vr < 0.7 and c is not None and m20 is not None and m20 > 0 and abs(c - m20) / m20 < 0.02:
+        score += 8    # 缩量回踩贴均线
+
+    # 换手率
+    to = _f(turnover)
+    lv_tag, _, is_hot, _is_cold = turnover_level(to)
+    if to is not None and 2.0 <= to <= 5.0:
+        score += 5    # 活跃换手
+    if is_hot:
+        score -= 10   # 过热扣分
+
+    # 不过度延伸（贴着均线上方更稳）
+    if ext30 is not None and 0 <= ext30 <= 15:
+        score += 8
+
+    score = _clamp_score(score)
+
+    # —— 大白话买入理由（复用多空对比的做多清单）——
+    synth = {
+        "close": close, "ma20": ma20, "ma30": ma30,
+        "serenity_score": serenity, "vol_ratio": vol_ratio, "turnover": turnover,
+    }
+    bulls, _bears = _bull_bear_signals(synth)
+    reasons = list(bulls)
+    if gain_pct is not None:
+        reasons.append(f"近2-3月涨幅 {gain_pct}%，不算过热，没追高风险")
+    if not reasons:
+        reasons.append("技术面中规中矩，可小仓试探")
+    return score, reasons, False, ""
+
+
+def tech_buy_score(close, ma10, ma20, ma30, turnover, vol_ratio, rally, rally_threshold):
+    """
+    【热门板块龙头·技术买点】纯技术线打分（不要求紫苏叶卡位），用于热门板块成分股。
+    返回 (score:int 0~100, reasons:list[str], caution:str, exclude:bool, exclude_reason:str)。
+    暴涨排除口径与 next_day_buy_score 完全一致（同一滑块阈值）。
+    """
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    c, m20, m30 = _f(close), _f(ma20), _f(ma30)
+    gain_pct = (rally or {}).get("gain_pct")
+
+    # —— 暴涨排除（先判）——
+    ext30 = None
+    if c is not None and m30 is not None and m30 > 0:
+        ext30 = (c - m30) / m30 * 100
+    if gain_pct is not None and gain_pct > rally_threshold:
+        return 0, [], "", True, f"该板块虽热，但这只近2-3月已涨 {gain_pct}%（超 {rally_threshold}% 红线），追高风险大，先不推荐。"
+    if ext30 is not None and ext30 > 30:
+        return 0, [], "", True, f"该板块虽热，但这只已高出30日线 {round(ext30,1)}%（涨过头），追高风险大，先不推荐。"
+
+    # —— 技术打分（不含紫苏叶）——
+    score = 0
+    if m20 is not None and c is not None and m30 is not None and c > m20 and c > m30:
+        score += 60
+    elif c is not None and m30 is not None and c > m30:
+        score += 40
+    else:
+        score += 20
+
+    vr = _f(vol_ratio)
+    if vr is not None and vr > 1.5 and c is not None and m20 is not None and c > m20:
+        score += 12
+    elif vr is not None and 1.0 <= vr <= 1.5:
+        score += 6
+    elif vr is not None and vr < 0.7 and c is not None and m20 is not None and m20 > 0 and abs(c - m20) / m20 < 0.02:
+        score += 8
+
+    to = _f(turnover)
+    lv_tag, _, is_hot, _is_cold = turnover_level(to)
+    if to is not None and 2.0 <= to <= 5.0:
+        score += 5
+
+    caution_parts = []
+    if ext30 is not None and ext30 > 15:
+        score -= 8
+        caution_parts.append(f"已高出30日线 {round(ext30,1)}%，有点偏高，别追太猛")
+    if is_hot:
+        score -= 10
+        caution_parts.append(f"换手率偏热（{to}%，{lv_tag}），情绪亢奋需留意")
+
+    score = _clamp_score(score)
+
+    synth = {
+        "close": close, "ma20": ma20, "ma30": ma30,
+        "vol_ratio": vol_ratio, "turnover": turnover,
+    }
+    bulls, _bears = _bull_bear_signals(synth)
+    reasons = list(bulls)
+    if gain_pct is not None:
+        reasons.append(f"近2-3月涨幅 {gain_pct}%，未过热")
+    if not reasons:
+        reasons.append("技术面中规中矩，可小仓试探")
+    caution = "；".join(caution_parts)
+    return score, reasons, caution, False, ""
+
+
+def eval_daily_picks(sectors, rally_threshold):
+    """
+    【A·紫苏叶当日精选】从挖掘候选里挑次日买入 Top5。
+    返回 (picks:list[dict], excluded_cnt:int)。pick={code,name,sector,score,reasons,gain_pct}。
+    """
+    eval_buyability_for_sectors(sectors)  # 先保证有价/均线
+    seen = set()
+    candidates = []
+    for sec in sectors or []:
+        sec_name = sec.get("sector") or sec.get("name") or "未命名赛道"
+        for stk in sec.get("stocks", []) or []:
+            code = str(stk.get("code") or "")
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            candidates.append((sec_name, stk))
+
+    picks = []
+    excluded_cnt = 0
+    for sec_name, stk in candidates:
+        code = str(stk.get("code") or "")
+        try:
+            turnover, vol_ratio = fetch_turnover_vol(code)
+            rally = fetch_recent_rally(code)
+            score, reasons, exclude, exclude_reason = next_day_buy_score(
+                stk, turnover, vol_ratio, rally, rally_threshold
+            )
+            if exclude:
+                excluded_cnt += 1
+                continue
+            picks.append({
+                "code": code,
+                "name": stk.get("name") or code,
+                "sector": sec_name,
+                "score": score,
+                "serenity": stk.get("_score"),
+                "reasons": reasons,
+                "gain_pct": (rally or {}).get("gain_pct"),
+            })
+        except Exception:
+            continue
+    picks.sort(key=lambda p: -(p.get("score") or 0))
+    return picks[:5], excluded_cnt
+
+
+def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
+    """
+    【B·热门板块龙头·技术买点】取最热概念板块，每板块挑 per_board 只技术买点股（排除暴涨）。
+    返回 [{board, pct, picks:[{code,name,score,reasons,caution,gain_pct}], excluded}]。
+    单只/单板块失败跳过，整体不崩。
+    """
+    boards = fetch_hot_boards(top_boards)
+    result = []
+    for b in boards or []:
+        board_name = b.get("board")
+        board_pct = b.get("pct")
+        if not board_name:
+            continue
+        try:
+            cons = fetch_board_cons(board_name)
+        except Exception:
+            cons = None
+        if cons is None or len(cons) == 0:
+            continue
+
+        # —— 用成分表里的廉价字段预筛 shortlist（避免对全板块联网）——
+        try:
+            df = cons.copy()
+            if "pct" in df.columns:
+                df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
+                # 今日涨幅在 -3%~7%（非涨停、非大跌），更可能是健康买点
+                df = df[(df["pct"] >= -3) & (df["pct"] <= 7)]
+                df = df.sort_values("pct", ascending=False)
+            shortlist = df.head(8)
+        except Exception:
+            shortlist = cons.head(8)
+
+        picks = []
+        excluded = 0
+        for _i, r in shortlist.iterrows():
+            code = str(r.get("code") or "").zfill(6)
+            name = r.get("name") or code
+            if not code or code == "000000":
+                continue
+            try:
+                ma = fetch_price_ma(code)
+                turnover, vol_ratio = fetch_turnover_vol(code)
+                rally = fetch_recent_rally(code)
+                score, reasons, caution, exclude, _exr = tech_buy_score(
+                    ma.get("close"), ma.get("ma10"), ma.get("ma20"), ma.get("ma30"),
+                    turnover, vol_ratio, rally, rally_threshold
+                )
+                if exclude:
+                    excluded += 1
+                    continue
+                picks.append({
+                    "code": code, "name": name, "score": score,
+                    "reasons": reasons, "caution": caution,
+                    "gain_pct": (rally or {}).get("gain_pct"),
+                })
+            except Exception:
+                continue
+        picks.sort(key=lambda p: -(p.get("score") or 0))
+        result.append({
+            "board": board_name,
+            "pct": board_pct,
+            "picks": picks[:per_board],
+            "excluded": excluded,
+        })
+    return result
 
 
 def _avg_factor_dicts(*dicts):
@@ -2405,6 +2785,8 @@ def main():
                 with st.spinner("正在评估各股当前买点（看是否站上均线）…"):
                     eval_buyability_for_sectors(_secs)
                 st.session_state["miner_result"] = _secs
+                # 新一轮挖掘，清掉旧的『紫苏叶当日精选』（与本轮候选挂钩）
+                st.session_state.pop("daily_picks", None)
 
         sectors = st.session_state.get("miner_result")
         if sectors:
@@ -2456,6 +2838,123 @@ def main():
                            "每个赛道内已把『现在就能买（站上均线）』的票排在前面。")
                 st.caption("⚠️ AI 推荐仅供启发，代码/竞争格局/评分可能有误，收编前请自行核对。"
                            "🌿紫苏叶评分=公司卡位有多硬（基本面）；可买入度=按当天股价判断现在是不是买点（两者分开看）。")
+
+                # ============================================================
+                # 当日选股推荐（A 紫苏叶当日精选 + B 热门板块龙头）
+                # ============================================================
+                st.markdown("---")
+                st.markdown("### 🎯 当日选股推荐")
+                rally_thr = st.slider(
+                    "暴涨过滤：近2-3月涨幅超过多少就排除（避免追高）",
+                    min_value=30, max_value=120, value=60, step=5,
+                    help="同时作用于『紫苏叶当日精选』和『热门板块龙头』两份名单。"
+                         "比如设 60%，意味着近2-3月已涨超 60% 的票会被当作『涨过头』排除。",
+                )
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("📅 紫苏叶当日精选（次日买入 Top5）", use_container_width=True):
+                        with st.spinner("正在按当天股价+量价+涨幅，从候选里挑次日买入 Top5…"):
+                            picks, excluded_cnt = eval_daily_picks(sectors, rally_thr)
+                        st.session_state["daily_picks"] = {
+                            "picks": picks, "excluded": excluded_cnt, "thr": rally_thr,
+                        }
+                with col_b:
+                    if st.button("🔥 热门板块龙头·技术买点（每板块各3只）", use_container_width=True):
+                        with st.spinner("正在抓取热门板块成分股并评估技术买点（联网较多，稍慢）…"):
+                            boards = eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=rally_thr)
+                        st.session_state["hot_board_picks"] = {"boards": boards, "thr": rally_thr}
+
+                # —— A 面板：紫苏叶当日精选 ——
+                dp = st.session_state.get("daily_picks")
+                if dp is not None:
+                    st.markdown("#### 📅 紫苏叶当日精选 · 次日买入（按推荐度排序）")
+                    st.caption(f"从挖掘候选里挑出最适合明天买入的票（已排除近2-3月涨幅 > {dp.get('thr')}% 的暴涨股 "
+                               f"{dp.get('excluded', 0)} 只）。结合『站上均线/放量确认/紫苏叶卡位/换手不过热』综合评判，仅供参考。")
+                    picks = dp.get("picks") or []
+                    if not picks:
+                        st.info("当前阈值下没有合适的次日买入标的（可能候选都还在均线下方，或都被暴涨过滤了）。可调高滑块再试。")
+                    else:
+                        for rank, p in enumerate(picks, 1):
+                            sc = p.get("score") or 0
+                            if sc >= 75:
+                                rec_tag, rec_bg = "强烈推荐", "#1a7f37"
+                            elif sc >= 55:
+                                rec_tag, rec_bg = "可考虑", "#9a6700"
+                            else:
+                                rec_tag, rec_bg = "谨慎", "#b00020"
+                            sr = p.get("serenity")
+                            sr_html = (f"<span style='background:#1a3c8c;color:#fff;border-radius:8px;"
+                                       f"padding:1px 8px;font-size:13px;margin-left:8px;'>🌿 {sr}/100</span>"
+                                       if sr is not None else "")
+                            gp = p.get("gain_pct")
+                            gp_txt = f"｜近2-3月涨幅 {gp}%" if gp is not None else ""
+                            reasons_html = "".join(
+                                f"<div style='margin:3px 0;font-size:14px;line-height:1.5;'>→ {r}</div>"
+                                for r in (p.get("reasons") or [])
+                            ) or "<div style='color:#888;'>技术面中规中矩</div>"
+                            st.markdown(
+                                f"<div style='background:#f6f9ff;border:1px solid #d6e4ff;border-radius:10px;"
+                                f"padding:12px 14px;margin:8px 0;'>"
+                                f"<div style='font-size:16px;font-weight:800;color:#1a3c8c;'>"
+                                f"#{rank} {p.get('name')}（{p.get('code')}）"
+                                f"<span style='background:{rec_bg};color:#fff;border-radius:8px;padding:1px 8px;"
+                                f"font-size:13px;margin-left:8px;'>推荐度 {sc}/100 · {rec_tag}</span>{sr_html}</div>"
+                                f"<div style='color:#555;font-size:13px;margin-top:4px;'>所属赛道：{p.get('sector')}{gp_txt}</div>"
+                                f"<div style='margin-top:6px;'><b>明天买点理由：</b>{reasons_html}</div>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                # —— B 面板：热门板块龙头 ——
+                hb = st.session_state.get("hot_board_picks")
+                if hb is not None:
+                    st.markdown("#### 🔥 热门板块龙头 · 技术买点")
+                    st.caption(f"龙头=最近最热门的板块（按当日板块涨幅排序），在每个热门板块成分股里按"
+                               f"『技术线 + 当前股价』挑买点，**不要求紫苏叶卡位，仅技术参考**；"
+                               f"同样已排除近2-3月涨幅 > {hb.get('thr')}% 的暴涨股。")
+                    boards = hb.get("boards") or []
+                    if not boards:
+                        st.info("暂时没抓到热门板块数据（行情接口可能临时不可用），稍后再点一次试试。")
+                    else:
+                        for bd in boards:
+                            bpct = bd.get("pct")
+                            bpct_txt = f"（板块涨 {bpct}%）" if bpct is not None else ""
+                            exn = bd.get("excluded", 0)
+                            exn_txt = f"｜已排除暴涨股 {exn} 只" if exn else ""
+                            with st.expander(f"🔥 {bd.get('board')}{bpct_txt}", expanded=True):
+                                bpicks = bd.get("picks") or []
+                                if exn_txt:
+                                    st.caption(exn_txt.lstrip("｜"))
+                                if not bpicks:
+                                    st.info("这个板块里暂没挑到合适的技术买点股（可能都偏高或被暴涨过滤了）。")
+                                else:
+                                    for bp in bpicks:
+                                        sc = bp.get("score") or 0
+                                        gp = bp.get("gain_pct")
+                                        gp_txt = f"｜近2-3月涨幅 {gp}%" if gp is not None else ""
+                                        reasons_html = "".join(
+                                            f"<div style='margin:3px 0;font-size:14px;line-height:1.5;'>→ {r}</div>"
+                                            for r in (bp.get("reasons") or [])
+                                        ) or "<div style='color:#888;'>技术面中规中矩</div>"
+                                        caution = (bp.get("caution") or "").strip()
+                                        caution_html = (f"<div style='color:#b00020;margin-top:4px;font-size:13px;'>"
+                                                        f"⚠️ {caution}</div>" if caution else "")
+                                        st.markdown(
+                                            f"<div style='background:#fff7f0;border:1px solid #ffd8b8;border-radius:10px;"
+                                            f"padding:12px 14px;margin:8px 0;'>"
+                                            f"<div style='font-size:16px;font-weight:800;color:#9a3412;'>"
+                                            f"{bp.get('name')}（{bp.get('code')}）"
+                                            f"<span style='background:#9a3412;color:#fff;border-radius:8px;padding:1px 8px;"
+                                            f"font-size:13px;margin-left:8px;'>技术买点 {sc}/100</span></div>"
+                                            f"<div style='color:#555;font-size:13px;margin-top:4px;'>{gp_txt.lstrip('｜')}</div>"
+                                            f"<div style='margin-top:6px;'><b>买入理由：</b>{reasons_html}</div>"
+                                            f"{caution_html}"
+                                            f"</div>",
+                                            unsafe_allow_html=True,
+                                        )
+
+                st.markdown("---")
                 for si, sec in enumerate(sectors_sorted):
                     sname = sec.get("sector", "未知赛道")
                     avg = sec.get("_avg")
