@@ -1082,7 +1082,7 @@ def fetch_hot_boards(top_n=3):
         if df is None or df.empty:
             errs.append(f"{fn}:返回空表")
             continue
-        name_col = _pick_col(df, ["板块名称", "概念名称", "行业名称", "名称"])
+        name_col = _pick_col(df, ["板块名称", "概念名称", "行业名称", "板块", "名称"])
         pct_col = _pick_col(df, ["涨跌幅", "涨幅", "涨跌幅(%)"])
         if not name_col or not pct_col:
             errs.append(f"{fn}:列名不匹配({list(df.columns)[:6]})")
@@ -1113,19 +1113,27 @@ def fetch_board_cons(board):
     ak = _get_akshare()
     if ak is None or not board:
         return None
-    for fn in ("stock_board_concept_cons_em", "stock_board_industry_cons_em"):
+    for fn in ("stock_board_industry_cons_ths", "stock_board_concept_cons_ths",
+               "stock_board_concept_cons_em", "stock_board_industry_cons_em"):
         try:
             func = getattr(ak, fn, None)
             if func is None:
                 continue
-            df = func(symbol=str(board))
+            # 同花顺接口用 sector=，东财接口用 symbol=，逐一尝试
+            try:
+                df = func(symbol=str(board))
+            except TypeError:
+                try:
+                    df = func(sector=str(board))
+                except Exception:
+                    df = None
             if df is None or df.empty:
                 continue
-            code_col = _pick_col(df, ["代码", "股票代码"])
-            name_col = _pick_col(df, ["名称", "股票名称"])
-            pct_col = _pick_col(df, ["涨跌幅", "涨幅"])
-            to_col = _pick_col(df, ["换手率"])
-            price_col = _pick_col(df, ["最新价", "现价", "收盘"])
+            code_col = _pick_col(df, ["代码", "股票代码", "code"])
+            name_col = _pick_col(df, ["名称", "股票名称", "name"])
+            pct_col = _pick_col(df, ["涨跌幅", "涨幅", "涨跌幅(%)"])
+            to_col = _pick_col(df, ["换手率", "换手率(%)"])
+            price_col = _pick_col(df, ["最新价", "现价", "收盘", "最新"])
             if not code_col or not name_col:
                 continue
             out = pd.DataFrame()
