@@ -1058,38 +1058,50 @@ def _pick_col(df, candidates):
     return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_hot_boards(top_n=3):
     """
     【热门板块】取当前涨幅最高的前 top_n 个概念板块（主源）/行业板块（备源）。
-    返回 [{"board": 板块名, "pct": 涨跌幅%}]；失败返回 []。
+    返回 (boards:list[{"board":名,"pct":涨幅%}], err:str)。成功时 err=""；全失败时 boards=[] 且 err 含原因。
+    不做缓存：本函数只在点按钮时触发，避免把临时失败缓存住导致『稍后再点也没用』。
     """
     ak = _get_akshare()
     if ak is None:
-        return []
-    for fn in ("stock_board_concept_name_em", "stock_board_industry_name_em"):
+        return [], "未安装行情库 akshare"
+    errs = []
+    for fn in ("stock_board_concept_name_em", "stock_board_industry_name_em",
+               "stock_board_concept_name_ths", "stock_board_industry_summary_ths"):
+        func = getattr(ak, fn, None)
+        if func is None:
+            errs.append(f"{fn}:无此接口")
+            continue
         try:
-            func = getattr(ak, fn, None)
-            if func is None:
-                continue
             df = func()
-            if df is None or df.empty:
-                continue
-            name_col = _pick_col(df, ["板块名称", "概念名称", "名称"])
-            pct_col = _pick_col(df, ["涨跌幅", "涨幅"])
-            if not name_col or not pct_col:
-                continue
+        except Exception as e:
+            errs.append(f"{fn}:{repr(e)[:80]}")
+            continue
+        if df is None or df.empty:
+            errs.append(f"{fn}:返回空表")
+            continue
+        name_col = _pick_col(df, ["板块名称", "概念名称", "行业名称", "名称"])
+        pct_col = _pick_col(df, ["涨跌幅", "涨幅", "涨跌幅(%)"])
+        if not name_col or not pct_col:
+            errs.append(f"{fn}:列名不匹配({list(df.columns)[:6]})")
+            continue
+        try:
             tmp = df.copy()
-            tmp["_pct"] = pd.to_numeric(tmp[pct_col], errors="coerce")
+            tmp["_pct"] = pd.to_numeric(tmp[pct_col].astype(str).str.replace("%", "", regex=False),
+                                        errors="coerce")
             tmp = tmp.dropna(subset=["_pct"]).sort_values("_pct", ascending=False)
             out = []
             for _, r in tmp.head(top_n).iterrows():
                 out.append({"board": str(r[name_col]), "pct": round(float(r["_pct"]), 2)})
             if out:
-                return out
-        except Exception:
+                return out, ""
+            errs.append(f"{fn}:排序后为空")
+        except Exception as e:
+            errs.append(f"{fn}:{repr(e)[:80]}")
             continue
-    return []
+    return [], "；".join(errs) if errs else "未知原因"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1787,8 +1799,11 @@ def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
     【B·热门板块龙头·技术买点】取最热概念板块，每板块挑 per_board 只技术买点股（排除暴涨）。
     返回 [{board, pct, picks:[{code,name,score,reasons,caution,gain_pct}], excluded}]。
     单只/单板块失败跳过，整体不崩。
+    返回 (result:list, err:str)。err 非空表示连热门板块列表都没取到（含诊断信息）。
     """
-    boards = fetch_hot_boards(top_boards)
+    boards, err = fetch_hot_boards(top_boards)
+    if not boards:
+        return [], err
     result = []
     for b in boards or []:
         board_name = b.get("board")
@@ -1846,7 +1861,7 @@ def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
             "picks": picks[:per_board],
             "excluded": excluded,
         })
-    return result
+    return result, ""
 
 
 def _avg_factor_dicts(*dicts):
@@ -2862,8 +2877,8 @@ def main():
                 with col_b:
                     if st.button("🔥 热门板块龙头·技术买点（每板块各3只）", use_container_width=True):
                         with st.spinner("正在抓取热门板块成分股并评估技术买点（联网较多，稍慢）…"):
-                            boards = eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=rally_thr)
-                        st.session_state["hot_board_picks"] = {"boards": boards, "thr": rally_thr}
+                            boards, hb_err = eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=rally_thr)
+                        st.session_state["hot_board_picks"] = {"boards": boards, "thr": rally_thr, "err": hb_err}
 
                 # —— A 面板：紫苏叶当日精选 ——
                 dp = st.session_state.get("daily_picks")
@@ -2916,6 +2931,8 @@ def main():
                     boards = hb.get("boards") or []
                     if not boards:
                         st.info("暂时没抓到热门板块数据（行情接口可能临时不可用），稍后再点一次试试。")
+                        if hb.get("err"):
+                            st.caption(f"🔧 诊断信息（截图发我可帮你定位）：{hb.get('err')}")
                     else:
                         for bd in boards:
                             bpct = bd.get("pct")
