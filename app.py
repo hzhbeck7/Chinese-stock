@@ -1104,48 +1104,59 @@ def fetch_hot_boards(top_n=3):
     return [], "；".join(errs) if errs else "未知原因"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_board_cons(board):
     """
     【板块成分股】取某板块的成分股精简表（代码/名称/今日涨跌幅/换手率/最新价）。
-    主源概念成分，备源行业成分。返回 DataFrame（统一列名 code/name/pct/turnover/price）；失败返回 None。
+    返回 (DataFrame 或 None, err_str)。不做缓存，避免把失败结果缓存 30 分钟。
+    优先同花顺行业/概念成分（云端可达），其次东财（本地可达）。
     """
     ak = _get_akshare()
     if ak is None or not board:
-        return None
+        return None, "akshare 未安装或板块名为空"
+    errs = []
     for fn in ("stock_board_industry_cons_ths", "stock_board_concept_cons_ths",
                "stock_board_concept_cons_em", "stock_board_industry_cons_em"):
-        try:
-            func = getattr(ak, fn, None)
-            if func is None:
-                continue
-            # 同花顺接口用 sector=，东财接口用 symbol=，逐一尝试
+        func = getattr(ak, fn, None)
+        if func is None:
+            errs.append(f"{fn}:无此接口")
+            continue
+        df = None
+        # 同花顺/东财参数名不同，都尝试
+        for kw in ({"symbol": str(board)}, {"sector": str(board)}):
             try:
-                df = func(symbol=str(board))
+                df = func(**kw)
+                if df is not None and not df.empty:
+                    break
             except TypeError:
-                try:
-                    df = func(sector=str(board))
-                except Exception:
-                    df = None
-            if df is None or df.empty:
                 continue
-            code_col = _pick_col(df, ["代码", "股票代码", "code"])
-            name_col = _pick_col(df, ["名称", "股票名称", "name"])
-            pct_col = _pick_col(df, ["涨跌幅", "涨幅", "涨跌幅(%)"])
-            to_col = _pick_col(df, ["换手率", "换手率(%)"])
-            price_col = _pick_col(df, ["最新价", "现价", "收盘", "最新"])
-            if not code_col or not name_col:
-                continue
+            except Exception as e:
+                errs.append(f"{fn}({list(kw.keys())[0]}=):{repr(e)[:80]}")
+                df = None
+                break
+        if df is None or df.empty:
+            if not any(fn in s for s in errs):
+                errs.append(f"{fn}:返回空")
+            continue
+        code_col = _pick_col(df, ["代码", "股票代码", "code"])
+        name_col = _pick_col(df, ["名称", "股票名称", "name"])
+        if not code_col or not name_col:
+            errs.append(f"{fn}:列名不匹配{list(df.columns)[:6]}")
+            continue
+        pct_col = _pick_col(df, ["涨跌幅", "涨幅", "涨跌幅(%)"])
+        to_col = _pick_col(df, ["换手率", "换手率(%)"])
+        price_col = _pick_col(df, ["最新价", "现价", "收盘", "最新"])
+        try:
             out = pd.DataFrame()
             out["code"] = df[code_col].astype(str).str.zfill(6)
             out["name"] = df[name_col].astype(str)
             out["pct"] = pd.to_numeric(df[pct_col], errors="coerce") if pct_col else None
             out["turnover"] = pd.to_numeric(df[to_col], errors="coerce") if to_col else None
             out["price"] = pd.to_numeric(df[price_col], errors="coerce") if price_col else None
-            return out
-        except Exception:
+            return out, ""
+        except Exception as e:
+            errs.append(f"{fn}:解析失败:{repr(e)[:60]}")
             continue
-    return None
+    return None, "；".join(errs) if errs else "未知原因"
 
 
 def _to_float_pct(v):
@@ -1805,9 +1816,8 @@ def eval_daily_picks(sectors, rally_threshold):
 def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
     """
     【B·热门板块龙头·技术买点】取最热概念板块，每板块挑 per_board 只技术买点股（排除暴涨）。
-    返回 [{board, pct, picks:[{code,name,score,reasons,caution,gain_pct}], excluded}]。
-    单只/单板块失败跳过，整体不崩。
     返回 (result:list, err:str)。err 非空表示连热门板块列表都没取到（含诊断信息）。
+    即使成分股取不到，result 里也会有占位项（picks=[], cons_err 含原因），不再静默返回空列表。
     """
     boards, err = fetch_hot_boards(top_boards)
     if not boards:
@@ -1818,11 +1828,20 @@ def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
         board_pct = b.get("pct")
         if not board_name:
             continue
+        # —— 先放占位，保证板块名一定出现在结果里 ——
+        board_item = {
+            "board": board_name, "pct": board_pct,
+            "picks": [], "excluded": 0, "cons_err": "",
+        }
+        result.append(board_item)
+
         try:
-            cons = fetch_board_cons(board_name)
-        except Exception:
-            cons = None
+            cons, cons_err = fetch_board_cons(board_name)
+        except Exception as e:
+            board_item["cons_err"] = f"成分股接口异常：{repr(e)[:100]}"
+            continue
         if cons is None or len(cons) == 0:
+            board_item["cons_err"] = cons_err or "成分股接口返回空（东财云端可能受限，同花顺成分股接口也未命中）"
             continue
 
         # —— 用成分表里的廉价字段预筛 shortlist（避免对全板块联网）——
@@ -1830,7 +1849,6 @@ def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
             df = cons.copy()
             if "pct" in df.columns:
                 df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
-                # 今日涨幅在 -3%~7%（非涨停、非大跌），更可能是健康买点
                 df = df[(df["pct"] >= -3) & (df["pct"] <= 7)]
                 df = df.sort_values("pct", ascending=False)
             shortlist = df.head(8)
@@ -1863,12 +1881,8 @@ def eval_hot_board_picks(top_boards=3, per_board=3, rally_threshold=60):
             except Exception:
                 continue
         picks.sort(key=lambda p: -(p.get("score") or 0))
-        result.append({
-            "board": board_name,
-            "pct": board_pct,
-            "picks": picks[:per_board],
-            "excluded": excluded,
-        })
+        board_item["picks"] = picks[:per_board]
+        board_item["excluded"] = excluded
     return result, ""
 
 
@@ -2951,7 +2965,10 @@ def main():
                                 bpicks = bd.get("picks") or []
                                 if exn_txt:
                                     st.caption(exn_txt.lstrip("｜"))
-                                if not bpicks:
+                                if bd.get("cons_err"):
+                                    st.warning(f"成分股数据暂时获取不到：{bd.get('cons_err')}")
+                                    st.caption("🔧 东财成分股接口被云端IP限制，稍后可能自动恢复；或刷新页面重试。")
+                                elif not bpicks:
                                     st.info("这个板块里暂没挑到合适的技术买点股（可能都偏高或被暴涨过滤了）。")
                                 else:
                                     for bp in bpicks:
